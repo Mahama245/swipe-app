@@ -22,6 +22,36 @@ app.use(express.static(path.join(__dirname, "public")));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
+// ---------------------------------------------------------------------------
+// BRUTE-FORCE LOCKOUT — tracks failed login attempts per username in memory.
+// After MAX_ATTEMPTS failures, that username is locked for LOCKOUT_MS.
+// (Resets if the server restarts — acceptable tradeoff for simplicity.)
+// ---------------------------------------------------------------------------
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
+const failedLogins = new Map(); // username -> { attempts, lockedUntil }
+
+function getLoginState(username) {
+  return failedLogins.get(username) || { attempts: 0, lockedUntil: 0 };
+}
+
+function recordFailedLogin(username) {
+  const state = getLoginState(username);
+  state.attempts += 1;
+  let justLocked = false;
+  if (state.attempts >= MAX_ATTEMPTS) {
+    state.lockedUntil = Date.now() + LOCKOUT_MS;
+    state.attempts = 0;
+    justLocked = true;
+  }
+  failedLogins.set(username, state);
+  return justLocked;
+}
+
+function clearFailedLogins(username) {
+  failedLogins.delete(username);
+}
+
 function authMiddleware(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -50,35 +80,30 @@ function safe(handler) {
 // ---------------------------------------------------------------------------
 // AUTH ROUTES
 // ---------------------------------------------------------------------------
-app.post("/api/register", safe(async (req, res) => {
-  const { username, password } = req.body || {};
-  if (!username || !password || username.trim().length < 3 || password.length < 4) {
-    return res.status(400).json({ error: "Username (3+ chars) and password (4+ chars) required." });
-  }
-  const clean = username.trim().toLowerCase();
-  if (await db.getUserByUsername(clean)) {
-    return res.status(409).json({ error: "That username is already taken." });
-  }
-  const hash = bcrypt.hashSync(password, 10);
-  const user = await db.createUser(clean, hash);
-  const token = jwt.sign({ uid: user.id, username: clean }, JWT_SECRET, { expiresIn: "30d" });
-  res.json({ token, username: clean });
-}));
-
 app.post("/api/login", safe(async (req, res) => {
   const { username, password } = req.body || {};
   const clean = (username || "").trim().toLowerCase();
+
+  const state = getLoginState(clean);
+  if (state.lockedUntil && Date.now() < state.lockedUntil) {
+    const secondsLeft = Math.ceil((state.lockedUntil - Date.now()) / 1000);
+    const minutesLeft = Math.ceil(secondsLeft / 60);
+    return res.status(429).json({ error: `Too many failed attempts. Try again in ${minutesLeft} minute(s).` });
+  }
+
   const user = await db.getUserByUsername(clean);
   if (!user || !bcrypt.compareSync(password || "", user.password_hash)) {
+    const justLocked = recordFailedLogin(clean);
+    if (justLocked) {
+      return res.status(429).json({ error: `Too many failed attempts. Try again in ${Math.ceil(LOCKOUT_MS / 60000)} minute(s).` });
+    }
     return res.status(401).json({ error: "Invalid username or password." });
   }
+
+  clearFailedLogins(clean);
   const token = jwt.sign({ uid: user.id, username: user.username }, JWT_SECRET, { expiresIn: "30d" });
   res.json({ token, username: user.username });
 }));
-
-app.get("/api/me", authMiddleware, (req, res) => {
-  res.json({ id: req.userId, username: req.username });
-});
 
 // ---------------------------------------------------------------------------
 // CONTACTS
