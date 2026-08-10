@@ -50,7 +50,7 @@ async function nextId(kind) {
     { $inc: { seq: 1 } },
     { upsert: true, returnDocument: "after" }
   );
-  return result.value.seq;
+  return result.seq;
 }
 
 // ---------------------------------------------------------------------------
