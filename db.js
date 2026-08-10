@@ -1,85 +1,93 @@
-// db.js — a tiny JSON-file-backed database. No native compilation required
-// (this is what avoids the Visual Studio / node-gyp build errors that
-// better-sqlite3 needs on Windows). Fine for a friends-group-scale app.
+// db.js — MongoDB Atlas backed database layer for SWIPE.
+// Replaces the old JSON-file version. All functions are now ASYNC
+// (they return Promises), because talking to MongoDB is asynchronous.
+// server.js has been updated to `await` every call into this file.
 
-const fs = require("fs");
-const path = require("path");
+const { MongoClient } = require("mongodb");
 
-const DB_PATH = path.join(__dirname, "data", "db.json");
-
-function emptyDb() {
-  return {
-    counters: { user: 0, message: 0, status: 0, meeting_message: 0 },
-    users: [],           // { id, username, password_hash, created_at }
-    contacts: [],        // { user_id, contact_id, created_at }
-    messages: [],        // { id, sender_id, receiver_id, kind, numbers, image, created_at }
-    statuses: [],        // { id, user_id, text, image, created_at }
-    meetings: [],        // { pin, host_id, created_at }
-    meeting_messages: [] // { id, pin, sender_username, numbers, created_at }
-  };
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) {
+  throw new Error("MONGODB_URI is not set. Add it to your .env file (local) or Render environment variables (production).");
 }
 
-let state = null;
+const client = new MongoClient(MONGODB_URI);
 
-function load() {
-  if (state) return state;
-  if (fs.existsSync(DB_PATH)) {
-    try {
-      state = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-    } catch (e) {
-      state = emptyDb();
-    }
-  } else {
-    state = emptyDb();
-  }
-  return state;
+let db = null;
+let usersCol, contactsCol, messagesCol, statusesCol, meetingsCol, meetingMessagesCol, countersCol;
+
+// ---------------------------------------------------------------------------
+// CONNECTION
+// ---------------------------------------------------------------------------
+async function connect() {
+  if (db) return db; // already connected, reuse
+  await client.connect();
+  db = client.db("swipe"); // database name inside your Atlas cluster
+
+  usersCol = db.collection("users");
+  contactsCol = db.collection("contacts");
+  messagesCol = db.collection("messages");
+  statusesCol = db.collection("statuses");
+  meetingsCol = db.collection("meetings");
+  meetingMessagesCol = db.collection("meeting_messages");
+  countersCol = db.collection("counters");
+
+  // Indexes — keep lookups fast and enforce uniqueness where it matters.
+  await usersCol.createIndex({ username: 1 }, { unique: true });
+  await contactsCol.createIndex({ user_id: 1, contact_id: 1 }, { unique: true });
+  await messagesCol.createIndex({ sender_id: 1, receiver_id: 1 });
+  await meetingsCol.createIndex({ pin: 1 }, { unique: true });
+  await meetingMessagesCol.createIndex({ pin: 1 });
+
+  console.log("Connected to MongoDB Atlas (database: swipe)");
+  return db;
 }
 
-function save() {
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  fs.writeFileSync(DB_PATH, JSON.stringify(state, null, 2));
-}
-
-function nextId(kind) {
-  state.counters[kind] = (state.counters[kind] || 0) + 1;
-  return state.counters[kind];
+// Mimics the old auto-incrementing numeric IDs (1, 2, 3...) so the rest of
+// the app — which sorts/compares ids as numbers — doesn't need to change.
+async function nextId(kind) {
+  const result = await countersCol.findOneAndUpdate(
+    { _id: kind },
+    { $inc: { seq: 1 } },
+    { upsert: true, returnDocument: "after" }
+  );
+  return result.value.seq;
 }
 
 // ---------------------------------------------------------------------------
 // USERS
 // ---------------------------------------------------------------------------
-function getUserByUsername(username) {
-  load();
-  return state.users.find(u => u.username === username) || null;
+async function getUserByUsername(username) {
+  return usersCol.findOne({ username });
 }
-function getUserById(id) {
-  load();
-  return state.users.find(u => u.id === id) || null;
+async function getUserById(id) {
+  return usersCol.findOne({ id });
 }
-function createUser(username, password_hash) {
-  load();
-  const user = { id: nextId("user"), username, password_hash, created_at: new Date().toISOString() };
-  state.users.push(user);
-  save();
+async function createUser(username, password_hash) {
+  const user = { id: await nextId("user"), username, password_hash, created_at: new Date().toISOString() };
+  await usersCol.insertOne(user);
   return user;
 }
 
 // ---------------------------------------------------------------------------
 // CONTACTS (mutual)
 // ---------------------------------------------------------------------------
-function addContactPair(userId, contactId) {
-  load();
-  const exists1 = state.contacts.some(c => c.user_id === userId && c.contact_id === contactId);
-  if (!exists1) state.contacts.push({ user_id: userId, contact_id: contactId, created_at: new Date().toISOString() });
-  const exists2 = state.contacts.some(c => c.user_id === contactId && c.contact_id === userId);
-  if (!exists2) state.contacts.push({ user_id: contactId, contact_id: userId, created_at: new Date().toISOString() });
-  save();
+async function addContactPair(userId, contactId) {
+  const now = new Date().toISOString();
+  await contactsCol.updateOne(
+    { user_id: userId, contact_id: contactId },
+    { $setOnInsert: { user_id: userId, contact_id: contactId, created_at: now } },
+    { upsert: true }
+  );
+  await contactsCol.updateOne(
+    { user_id: contactId, contact_id: userId },
+    { $setOnInsert: { user_id: contactId, contact_id: userId, created_at: now } },
+    { upsert: true }
+  );
 }
-function getContacts(userId) {
-  load();
-  return state.contacts
-    .filter(c => c.user_id === userId)
-    .map(c => getUserById(c.contact_id))
+async function getContacts(userId) {
+  const rows = await contactsCol.find({ user_id: userId }).toArray();
+  const users = await Promise.all(rows.map(c => getUserById(c.contact_id)));
+  return users
     .filter(Boolean)
     .map(u => ({ id: u.id, username: u.username }))
     .sort((a, b) => a.username.localeCompare(b.username));
@@ -88,72 +96,68 @@ function getContacts(userId) {
 // ---------------------------------------------------------------------------
 // MESSAGES (1:1)
 // ---------------------------------------------------------------------------
-function getMessagesBetween(idA, idB) {
-  load();
-  return state.messages
-    .filter(m => (m.sender_id === idA && m.receiver_id === idB) || (m.sender_id === idB && m.receiver_id === idA))
-    .sort((a, b) => a.id - b.id);
+async function getMessagesBetween(idA, idB) {
+  const rows = await messagesCol.find({
+    $or: [
+      { sender_id: idA, receiver_id: idB },
+      { sender_id: idB, receiver_id: idA }
+    ]
+  }).toArray();
+  return rows.sort((a, b) => a.id - b.id);
 }
-function insertMessage({ sender_id, receiver_id, kind, numbers, image }) {
-  load();
+async function insertMessage({ sender_id, receiver_id, kind, numbers, image }) {
   const msg = {
-    id: nextId("message"),
+    id: await nextId("message"),
     sender_id, receiver_id, kind,
     numbers: numbers || null,
     image: image || null,
     created_at: new Date().toISOString()
   };
-  state.messages.push(msg);
-  save();
+  await messagesCol.insertOne(msg);
   return msg;
 }
 
 // ---------------------------------------------------------------------------
 // STATUSES
 // ---------------------------------------------------------------------------
-function getStatuses(limit) {
-  load();
-  return state.statuses
-    .slice()
-    .sort((a, b) => b.id - a.id)
-    .slice(0, limit || 100)
-    .map(s => ({ ...s, username: getUserById(s.user_id)?.username || "unknown" }));
+async function getStatuses(limit) {
+  const rows = await statusesCol.find({}).sort({ id: -1 }).limit(limit || 100).toArray();
+  const out = [];
+  for (const s of rows) {
+    const u = await getUserById(s.user_id);
+    out.push({ ...s, username: u?.username || "unknown" });
+  }
+  return out;
 }
-function insertStatus({ user_id, text, image }) {
-  load();
-  const status = { id: nextId("status"), user_id, text, image: image || null, created_at: new Date().toISOString() };
-  state.statuses.push(status);
-  save();
+async function insertStatus({ user_id, text, image }) {
+  const status = { id: await nextId("status"), user_id, text, image: image || null, created_at: new Date().toISOString() };
+  await statusesCol.insertOne(status);
   return status;
 }
 
 // ---------------------------------------------------------------------------
 // MEETINGS
 // ---------------------------------------------------------------------------
-function getMeeting(pin) {
-  load();
-  return state.meetings.find(m => m.pin === pin) || null;
+async function getMeeting(pin) {
+  return meetingsCol.findOne({ pin });
 }
-function createMeeting(pin, host_id) {
-  load();
+async function createMeeting(pin, host_id) {
   const meeting = { pin, host_id, created_at: new Date().toISOString() };
-  state.meetings.push(meeting);
-  save();
+  await meetingsCol.insertOne(meeting);
   return meeting;
 }
-function getMeetingMessages(pin) {
-  load();
-  return state.meeting_messages.filter(m => m.pin === pin).sort((a, b) => a.id - b.id);
+async function getMeetingMessages(pin) {
+  const rows = await meetingMessagesCol.find({ pin }).toArray();
+  return rows.sort((a, b) => a.id - b.id);
 }
-function insertMeetingMessage({ pin, sender_username, numbers }) {
-  load();
-  const msg = { id: nextId("meeting_message"), pin, sender_username, numbers, created_at: new Date().toISOString() };
-  state.meeting_messages.push(msg);
-  save();
+async function insertMeetingMessage({ pin, sender_username, numbers }) {
+  const msg = { id: await nextId("meeting_message"), pin, sender_username, numbers, created_at: new Date().toISOString() };
+  await meetingMessagesCol.insertOne(msg);
   return msg;
 }
 
 module.exports = {
+  connect,
   getUserByUsername, getUserById, createUser,
   addContactPair, getContacts,
   getMessagesBetween, insertMessage,
