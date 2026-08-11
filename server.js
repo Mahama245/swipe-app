@@ -152,4 +152,4 @@ app.post("/api/contacts", authMiddleware, safe(async (req, res) => {
 // never the plaintext or the formula. Friends agree on the formula out of band.
 // ---------------------------------------------------------------------------
 function roomFor(idA, idB) {
-  const [a, b]
+  const [a, b]= [idA, idB].sort((x, y) => x - y);
