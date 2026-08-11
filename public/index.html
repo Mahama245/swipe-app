@@ -166,7 +166,10 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
     <div class="auth-error" id="authError"></div>
     <div class="field"><label>Username</label><input type="text" id="authUsername" placeholder="e.g. mahama" autocomplete="username"></div>
     <div class="field"><label>Password</label><input type="password" id="authPassword" placeholder="••••••••" autocomplete="current-password"></div>
+    <div class="field" id="securityQuestionField" style="display:none;"><label>Security Question</label><input type="text" id="authSecurityQuestion" placeholder="e.g. What was your first pet's name?"></div>
+    <div class="field" id="securityAnswerField" style="display:none;"><label>Answer</label><input type="text" id="authSecurityAnswer" placeholder="Your answer" autocomplete="off"></div>
     <button class="btn-primary" id="authSubmitBtn">Log In</button>
+    <div id="forgotPasswordLink" style="text-align:center; margin-top:12px; font-size:13px; color:var(--muted); cursor:pointer;">Forgot password?</div>
   </div>
 </div>
 
@@ -225,6 +228,10 @@ document.querySelectorAll(".auth-tab").forEach(tab => {
     document.querySelectorAll(".auth-tab").forEach(t => t.classList.toggle("active", t === tab));
     document.getElementById("authSubmitBtn").textContent = authMode === "login" ? "Log In" : "Sign Up";
     document.getElementById("authError").classList.remove("show");
+    const isRegister = authMode === "register";
+    document.getElementById("securityQuestionField").style.display = isRegister ? "block" : "none";
+    document.getElementById("securityAnswerField").style.display = isRegister ? "block" : "none";
+    document.getElementById("forgotPasswordLink").style.display = isRegister ? "none" : "block";
   });
 });
 
@@ -241,11 +248,21 @@ async function submitAuth(){
   const username = document.getElementById("authUsername").value.trim();
   const password = document.getElementById("authPassword").value;
   if (!username || !password){ showAuthError("Enter a username and password."); return; }
+
+  const body = { username, password };
+  if (authMode === "register"){
+    const securityQuestion = document.getElementById("authSecurityQuestion").value.trim();
+    const securityAnswer = document.getElementById("authSecurityAnswer").value.trim();
+    if (!securityQuestion || !securityAnswer){ showAuthError("Please add a security question and answer."); return; }
+    body.securityQuestion = securityQuestion;
+    body.securityAnswer = securityAnswer;
+  }
+
   try{
     const res = await fetch(`/api/${authMode === "login" ? "login" : "register"}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password })
+      body: JSON.stringify(body)
     });
     const data = await res.json();
     if (!res.ok){ showAuthError(data.error || "Something went wrong."); return; }
@@ -257,6 +274,56 @@ async function submitAuth(){
   }catch(e){
     showAuthError("Couldn't reach the server. Try again.");
   }
+}
+
+document.getElementById("forgotPasswordLink").addEventListener("click", () => {
+  openModal({
+    title: "Forgot Password",
+    sub: "Enter your username to see your security question.",
+    fields: [{ id: "username", label: "Username", placeholder: "e.g. mahama" }],
+    submitLabel: "Next",
+    onSubmit: async (values) => {
+      const username = (values.username || "").trim();
+      if (!username) return { error: "Enter your username." };
+      try{
+        const res = await fetch(`/api/forgot-password/${encodeURIComponent(username)}`);
+        const data = await res.json();
+        if (!res.ok) return { error: data.error || "Something went wrong." };
+        showResetModal(username, data.question);
+      }catch(e){
+        return { error: "Couldn't reach the server." };
+      }
+    }
+  });
+});
+
+function showResetModal(username, question){
+  openModal({
+    title: "Reset Password",
+    sub: question,
+    fields: [
+      { id: "answer", label: "Answer", placeholder: "Your answer" },
+      { id: "newPassword", label: "New Password", type: "password", placeholder: "••••••••" }
+    ],
+    submitLabel: "Reset Password",
+    onSubmit: async (values) => {
+      const answer = (values.answer || "").trim();
+      const newPassword = values.newPassword || "";
+      if (!answer || !newPassword) return { error: "Fill in both fields." };
+      try{
+        const res = await fetch("/api/forgot-password/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, answer, newPassword })
+        });
+        const data = await res.json();
+        if (!res.ok) return { error: data.error || "Something went wrong." };
+        toast("Password reset. You can log in now.");
+      }catch(e){
+        return { error: "Couldn't reach the server." };
+      }
+    }
+  });
 }
 
 document.getElementById("logoutBtn").addEventListener("click", () => {
