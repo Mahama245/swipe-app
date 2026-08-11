@@ -65,9 +65,7 @@ function safe(handler) {
       res.status(500).json({ error: "Server error." });
     });
   };
-}
-
-app.post("/api/login", safe(async (req, res) => {
+}app.post("/api/login", safe(async (req, res) => {
   const { username, password } = req.body || {};
   const clean = (username || "").trim().toLowerCase();
 
@@ -93,7 +91,7 @@ app.post("/api/login", safe(async (req, res) => {
 }));
 
 app.post("/api/register", safe(async (req, res) => {
-  const { username, password } = req.body || {};
+  const { username, password, securityQuestion, securityAnswer } = req.body || {};
   const clean = (username || "").trim().toLowerCase();
 
   if (!/^[a-z0-9_]{3,20}$/.test(clean)) {
@@ -102,6 +100,12 @@ app.post("/api/register", safe(async (req, res) => {
   if (!password || password.length < 6) {
     return res.status(400).json({ error: "Password must be at least 6 characters." });
   }
+  if (!securityQuestion || !securityQuestion.trim()) {
+    return res.status(400).json({ error: "Security question is required." });
+  }
+  if (!securityAnswer || !securityAnswer.trim()) {
+    return res.status(400).json({ error: "Security answer is required." });
+  }
 
   const existing = await db.getUserByUsername(clean);
   if (existing) {
@@ -109,10 +113,37 @@ app.post("/api/register", safe(async (req, res) => {
   }
 
   const password_hash = bcrypt.hashSync(password, 10);
-  const user = await db.createUser(clean, password_hash);
+  const security_answer_hash = bcrypt.hashSync(securityAnswer.trim().toLowerCase(), 10);
+  const user = await db.createUser(clean, password_hash, securityQuestion.trim(), security_answer_hash);
 
   const token = jwt.sign({ uid: user.id, username: user.username }, JWT_SECRET, { expiresIn: "30d" });
   res.json({ token, username: user.username });
+}));
+app.get("/api/forgot-password/:username", safe(async (req, res) => {
+  const clean = (req.params.username || "").trim().toLowerCase();
+  const user = await db.getUserByUsername(clean);
+  if (!user) return res.status(404).json({ error: "No account with that username." });
+  res.json({ question: user.security_question });
+}));
+
+app.post("/api/forgot-password/reset", safe(async (req, res) => {
+  const { username, answer, newPassword } = req.body || {};
+  const clean = (username || "").trim().toLowerCase();
+  const user = await db.getUserByUsername(clean);
+  if (!user) return res.status(404).json({ error: "No account with that username." });
+
+  const cleanAnswer = (answer || "").trim().toLowerCase();
+  if (!bcrypt.compareSync(cleanAnswer, user.security_answer_hash)) {
+    return res.status(401).json({ error: "That answer doesn't match." });
+  }
+  if (!newPassword || newPassword.length < 6) {
+    return res.status(400).json({ error: "New password must be at least 6 characters." });
+  }
+
+  const password_hash = bcrypt.hashSync(newPassword, 10);
+  await db.updatePassword(user.id, password_hash);
+  clearFailedLogins(clean);
+  res.json({ ok: true });
 }));
 
 app.get("/api/contacts", authMiddleware, safe(async (req, res) => {
@@ -174,7 +205,6 @@ app.post("/api/messages", authMiddleware, safe(async (req, res) => {
   io.to(roomFor(req.userId, other.id)).emit("chat:message", { withUserId: req.userId, message: payload });
   res.json({ message: payload });
 }));
-
 app.get("/api/statuses", authMiddleware, safe(async (req, res) => {
   res.json({ statuses: await db.getStatuses(100) });
 }));
