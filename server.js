@@ -11,25 +11,17 @@ const db = require("./db");
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-in-production";
 const PORT = process.env.PORT || 3000;
 
-// ---------------------------------------------------------------------------
-// APP + SOCKET SETUP
-// ---------------------------------------------------------------------------
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "8mb" })); // allow small base64 images
+app.use(express.json({ limit: "8mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-// ---------------------------------------------------------------------------
-// BRUTE-FORCE LOCKOUT — tracks failed login attempts per username in memory.
-// After MAX_ATTEMPTS failures, that username is locked for LOCKOUT_MS.
-// (Resets if the server restarts — acceptable tradeoff for simplicity.)
-// ---------------------------------------------------------------------------
 const MAX_ATTEMPTS = 5;
-const LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
-const failedLogins = new Map(); // username -> { attempts, lockedUntil }
+const LOCKOUT_MS = 15 * 60 * 1000;
+const failedLogins = new Map();
 
 function getLoginState(username) {
   return failedLogins.get(username) || { attempts: 0, lockedUntil: 0 };
@@ -66,8 +58,6 @@ function authMiddleware(req, res, next) {
   }
 }
 
-// Wraps an async route handler so thrown errors / rejected promises don't
-// crash the server — they get turned into a 500 response instead.
 function safe(handler) {
   return (req, res) => {
     Promise.resolve(handler(req, res)).catch(err => {
@@ -77,9 +67,6 @@ function safe(handler) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// AUTH ROUTES
-// ---------------------------------------------------------------------------
 app.post("/api/login", safe(async (req, res) => {
   const { username, password } = req.body || {};
   const clean = (username || "").trim().toLowerCase();
@@ -128,9 +115,6 @@ app.post("/api/register", safe(async (req, res) => {
   res.json({ token, username: user.username });
 }));
 
-// ---------------------------------------------------------------------------
-// CONTACTS
-// ---------------------------------------------------------------------------
 app.get("/api/contacts", authMiddleware, safe(async (req, res) => {
   res.json({ contacts: await db.getContacts(req.userId) });
 }));
@@ -147,9 +131,135 @@ app.post("/api/contacts", authMiddleware, safe(async (req, res) => {
   res.json({ contact: { id: target.id, username: target.username } });
 }));
 
-// ---------------------------------------------------------------------------
-// MESSAGES (1:1 chat) — server only ever stores/relays number arrays,
-// never the plaintext or the formula. Friends agree on the formula out of band.
-// ---------------------------------------------------------------------------
 function roomFor(idA, idB) {
-  const [a, b]= [idA, idB].sort((x, y) => x - y);
+  const [a, b] = [idA, idB].sort((x, y) => x - y);
+  return `chat:${a}:${b}`;
+}
+
+app.get("/api/messages/:username", authMiddleware, safe(async (req, res) => {
+  const other = await db.getUserByUsername(req.params.username.trim().toLowerCase());
+  if (!other) return res.status(404).json({ error: "User not found." });
+  const rows = await db.getMessagesBetween(req.userId, other.id);
+  const out = rows.map(r => ({
+    id: r.id,
+    from: r.sender_id === req.userId ? "You" : other.username,
+    kind: r.kind,
+    numbers: r.numbers || null,
+    image: r.image || null,
+    created_at: r.created_at
+  }));
+  res.json({ messages: out });
+}));
+
+app.post("/api/messages", authMiddleware, safe(async (req, res) => {
+  const { to, numbers, kind, image } = req.body || {};
+  const other = await db.getUserByUsername((to || "").trim().toLowerCase());
+  if (!other) return res.status(404).json({ error: "Recipient not found." });
+  const msgKind = kind === "image" ? "image" : "text";
+  if (msgKind === "text" && (!Array.isArray(numbers) || numbers.length === 0)) {
+    return res.status(400).json({ error: "Encoded numbers required." });
+  }
+
+  const saved = await db.insertMessage({ sender_id: req.userId, receiver_id: other.id, kind: msgKind, numbers, image });
+
+  const payload = {
+    id: saved.id,
+    from: req.username,
+    kind: msgKind,
+    numbers: numbers || null,
+    image: image || null,
+    created_at: saved.created_at
+  };
+
+  io.to(roomFor(req.userId, other.id)).emit("chat:message", { withUserId: req.userId, message: payload });
+  res.json({ message: payload });
+}));
+
+app.get("/api/statuses", authMiddleware, safe(async (req, res) => {
+  res.json({ statuses: await db.getStatuses(100) });
+}));
+
+app.post("/api/statuses", authMiddleware, safe(async (req, res) => {
+  const { text, image } = req.body || {};
+  if (!text || !text.trim()) return res.status(400).json({ error: "Status text required." });
+  const saved = await db.insertStatus({ user_id: req.userId, text: text.trim(), image });
+  io.emit("status:new", { id: saved.id, username: req.username, text: text.trim(), image: image || null, created_at: saved.created_at });
+  res.json({ ok: true });
+}));
+
+app.post("/api/meetings", authMiddleware, safe(async (req, res) => {
+  const { pin } = req.body || {};
+  const clean = (pin || "").trim();
+  if (clean.length < 4) return res.status(400).json({ error: "PIN must be at least 4 characters." });
+  if (await db.getMeeting(clean)) return res.status(409).json({ error: "That PIN is already in use. Pick another." });
+  await db.createMeeting(clean, req.userId);
+  res.json({ pin: clean });
+}));
+
+app.post("/api/meetings/:pin/join", authMiddleware, safe(async (req, res) => {
+  const meeting = await db.getMeeting(req.params.pin);
+  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  res.json({ pin: meeting.pin });
+}));
+
+app.get("/api/meetings/:pin/messages", authMiddleware, safe(async (req, res) => {
+  const meeting = await db.getMeeting(req.params.pin);
+  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  res.json({ messages: await db.getMeetingMessages(req.params.pin) });
+}));
+
+app.post("/api/meetings/:pin/messages", authMiddleware, safe(async (req, res) => {
+  const { numbers } = req.body || {};
+  const meeting = await db.getMeeting(req.params.pin);
+  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  if (!Array.isArray(numbers) || numbers.length === 0) return res.status(400).json({ error: "Encoded numbers required." });
+
+  const saved = await db.insertMeetingMessage({ pin: req.params.pin, sender_username: req.username, numbers });
+  io.to(`meeting:${req.params.pin}`).emit("meeting:message", saved);
+  res.json({ message: saved });
+}));
+
+io.use((socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    const payload = jwt.verify(token, JWT_SECRET);
+    socket.userId = payload.uid;
+    socket.username = payload.username;
+    next();
+  } catch (e) {
+    next(new Error("unauthorized"));
+  }
+});
+
+io.on("connection", async (socket) => {
+  try {
+    const contacts = await db.getContacts(socket.userId);
+    contacts.forEach(c => socket.join(roomFor(socket.userId, c.id)));
+  } catch (e) {
+    console.error("Error joining contact rooms:", e);
+  }
+
+  socket.on("meeting:join", (pin) => {
+    if (pin) socket.join(`meeting:${pin}`);
+  });
+
+  socket.on("contact:added", (contactId) => {
+    socket.join(roomFor(socket.userId, contactId));
+  });
+});
+
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+db.connect()
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`SWIPE server running on http://localhost:${PORT}`);
+    });
+  })
+  .catch(err => {
+    console.error("Failed to connect to MongoDB. Server not started.");
+    console.error(err);
+    process.exit(1);
+  });
