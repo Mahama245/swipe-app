@@ -105,6 +105,29 @@ app.post("/api/login", safe(async (req, res) => {
   res.json({ token, username: user.username });
 }));
 
+app.post("/api/register", safe(async (req, res) => {
+  const { username, password } = req.body || {};
+  const clean = (username || "").trim().toLowerCase();
+
+  if (!/^[a-z0-9_]{3,20}$/.test(clean)) {
+    return res.status(400).json({ error: "Username must be 3-20 characters: letters, numbers, underscores only." });
+  }
+  if (!password || password.length < 6) {
+    return res.status(400).json({ error: "Password must be at least 6 characters." });
+  }
+
+  const existing = await db.getUserByUsername(clean);
+  if (existing) {
+    return res.status(409).json({ error: "That username is already taken." });
+  }
+
+  const password_hash = bcrypt.hashSync(password, 10);
+  const user = await db.createUser(clean, password_hash);
+
+  const token = jwt.sign({ uid: user.id, username: user.username }, JWT_SECRET, { expiresIn: "30d" });
+  res.json({ token, username: user.username });
+}));
+
 // ---------------------------------------------------------------------------
 // CONTACTS
 // ---------------------------------------------------------------------------
@@ -129,149 +152,4 @@ app.post("/api/contacts", authMiddleware, safe(async (req, res) => {
 // never the plaintext or the formula. Friends agree on the formula out of band.
 // ---------------------------------------------------------------------------
 function roomFor(idA, idB) {
-  const [a, b] = [idA, idB].sort((x, y) => x - y);
-  return `chat:${a}:${b}`;
-}
-
-app.get("/api/messages/:username", authMiddleware, safe(async (req, res) => {
-  const other = await db.getUserByUsername(req.params.username.trim().toLowerCase());
-  if (!other) return res.status(404).json({ error: "User not found." });
-  const rows = await db.getMessagesBetween(req.userId, other.id);
-  const out = rows.map(r => ({
-    id: r.id,
-    from: r.sender_id === req.userId ? "You" : other.username,
-    kind: r.kind,
-    numbers: r.numbers || null,
-    image: r.image || null,
-    created_at: r.created_at
-  }));
-  res.json({ messages: out });
-}));
-
-app.post("/api/messages", authMiddleware, safe(async (req, res) => {
-  const { to, numbers, kind, image } = req.body || {};
-  const other = await db.getUserByUsername((to || "").trim().toLowerCase());
-  if (!other) return res.status(404).json({ error: "Recipient not found." });
-  const msgKind = kind === "image" ? "image" : "text";
-  if (msgKind === "text" && (!Array.isArray(numbers) || numbers.length === 0)) {
-    return res.status(400).json({ error: "Encoded numbers required." });
-  }
-
-  const saved = await db.insertMessage({ sender_id: req.userId, receiver_id: other.id, kind: msgKind, numbers, image });
-
-  const payload = {
-    id: saved.id,
-    from: req.username,
-    kind: msgKind,
-    numbers: numbers || null,
-    image: image || null,
-    created_at: saved.created_at
-  };
-
-  io.to(roomFor(req.userId, other.id)).emit("chat:message", { withUserId: req.userId, message: payload });
-  res.json({ message: payload });
-}));
-
-// ---------------------------------------------------------------------------
-// STATUSES
-// ---------------------------------------------------------------------------
-app.get("/api/statuses", authMiddleware, safe(async (req, res) => {
-  res.json({ statuses: await db.getStatuses(100) });
-}));
-
-app.post("/api/statuses", authMiddleware, safe(async (req, res) => {
-  const { text, image } = req.body || {};
-  if (!text || !text.trim()) return res.status(400).json({ error: "Status text required." });
-  const saved = await db.insertStatus({ user_id: req.userId, text: text.trim(), image });
-  io.emit("status:new", { id: saved.id, username: req.username, text: text.trim(), image: image || null, created_at: saved.created_at });
-  res.json({ ok: true });
-}));
-
-// ---------------------------------------------------------------------------
-// MEETINGS (PIN-based rooms). Formula is shared out-of-band by participants;
-// the server just relays encoded numbers between everyone in the room.
-// ---------------------------------------------------------------------------
-app.post("/api/meetings", authMiddleware, safe(async (req, res) => {
-  const { pin } = req.body || {};
-  const clean = (pin || "").trim();
-  if (clean.length < 4) return res.status(400).json({ error: "PIN must be at least 4 characters." });
-  if (await db.getMeeting(clean)) return res.status(409).json({ error: "That PIN is already in use. Pick another." });
-  await db.createMeeting(clean, req.userId);
-  res.json({ pin: clean });
-}));
-
-app.post("/api/meetings/:pin/join", authMiddleware, safe(async (req, res) => {
-  const meeting = await db.getMeeting(req.params.pin);
-  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
-  res.json({ pin: meeting.pin });
-}));
-
-app.get("/api/meetings/:pin/messages", authMiddleware, safe(async (req, res) => {
-  const meeting = await db.getMeeting(req.params.pin);
-  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
-  res.json({ messages: await db.getMeetingMessages(req.params.pin) });
-}));
-
-app.post("/api/meetings/:pin/messages", authMiddleware, safe(async (req, res) => {
-  const { numbers } = req.body || {};
-  const meeting = await db.getMeeting(req.params.pin);
-  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
-  if (!Array.isArray(numbers) || numbers.length === 0) return res.status(400).json({ error: "Encoded numbers required." });
-
-  const saved = await db.insertMeetingMessage({ pin: req.params.pin, sender_username: req.username, numbers });
-  io.to(`meeting:${req.params.pin}`).emit("meeting:message", saved);
-  res.json({ message: saved });
-}));
-
-// ---------------------------------------------------------------------------
-// SOCKET.IO — auth via handshake token, join relevant rooms
-// ---------------------------------------------------------------------------
-io.use((socket, next) => {
-  try {
-    const token = socket.handshake.auth?.token;
-    const payload = jwt.verify(token, JWT_SECRET);
-    socket.userId = payload.uid;
-    socket.username = payload.username;
-    next();
-  } catch (e) {
-    next(new Error("unauthorized"));
-  }
-});
-
-io.on("connection", async (socket) => {
-  try {
-    // join a room with every contact so messages route both ways
-    const contacts = await db.getContacts(socket.userId);
-    contacts.forEach(c => socket.join(roomFor(socket.userId, c.id)));
-  } catch (e) {
-    console.error("Error joining contact rooms:", e);
-  }
-
-  socket.on("meeting:join", (pin) => {
-    if (pin) socket.join(`meeting:${pin}`);
-  });
-
-  socket.on("contact:added", (contactId) => {
-    socket.join(roomFor(socket.userId, contactId));
-  });
-});
-
-// fallback to index.html for the SPA
-app.get("*", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-
-// ---------------------------------------------------------------------------
-// STARTUP — connect to MongoDB first, THEN start accepting requests.
-// ---------------------------------------------------------------------------
-db.connect()
-  .then(() => {
-    server.listen(PORT, () => {
-      console.log(`SWIPE server running on http://localhost:${PORT}`);
-    });
-  })
-  .catch(err => {
-    console.error("Failed to connect to MongoDB. Server not started.");
-    console.error(err);
-    process.exit(1);
-  });
+  const [a, b]
