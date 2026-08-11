@@ -15,13 +15,10 @@ const client = new MongoClient(MONGODB_URI);
 let db = null;
 let usersCol, contactsCol, messagesCol, statusesCol, meetingsCol, meetingMessagesCol, countersCol;
 
-// ---------------------------------------------------------------------------
-// CONNECTION
-// ---------------------------------------------------------------------------
 async function connect() {
-  if (db) return db; // already connected, reuse
+  if (db) return db;
   await client.connect();
-  db = client.db("swipe"); // database name inside your Atlas cluster
+  db = client.db("swipe");
 
   usersCol = db.collection("users");
   contactsCol = db.collection("contacts");
@@ -31,7 +28,6 @@ async function connect() {
   meetingMessagesCol = db.collection("meeting_messages");
   countersCol = db.collection("counters");
 
-  // Indexes — keep lookups fast and enforce uniqueness where it matters.
   await usersCol.createIndex({ username: 1 }, { unique: true });
   await contactsCol.createIndex({ user_id: 1, contact_id: 1 }, { unique: true });
   await messagesCol.createIndex({ sender_id: 1, receiver_id: 1 });
@@ -42,8 +38,6 @@ async function connect() {
   return db;
 }
 
-// Mimics the old auto-incrementing numeric IDs (1, 2, 3...) so the rest of
-// the app — which sorts/compares ids as numbers — doesn't need to change.
 async function nextId(kind) {
   const result = await countersCol.findOneAndUpdate(
     { _id: kind },
@@ -53,24 +47,29 @@ async function nextId(kind) {
   return result.seq;
 }
 
-// ---------------------------------------------------------------------------
-// USERS
-// ---------------------------------------------------------------------------
 async function getUserByUsername(username) {
   return usersCol.findOne({ username });
 }
 async function getUserById(id) {
   return usersCol.findOne({ id });
 }
-async function createUser(username, password_hash) {
-  const user = { id: await nextId("user"), username, password_hash, created_at: new Date().toISOString() };
+async function createUser(username, password_hash, security_question, security_answer_hash) {
+  const user = {
+    id: await nextId("user"),
+    username,
+    password_hash,
+    security_question,
+    security_answer_hash,
+    created_at: new Date().toISOString()
+  };
   await usersCol.insertOne(user);
   return user;
 }
 
-// ---------------------------------------------------------------------------
-// CONTACTS (mutual)
-// ---------------------------------------------------------------------------
+async function updatePassword(userId, password_hash) {
+  await usersCol.updateOne({ id: userId }, { $set: { password_hash } });
+}
+
 async function addContactPair(userId, contactId) {
   const now = new Date().toISOString();
   await contactsCol.updateOne(
@@ -93,9 +92,6 @@ async function getContacts(userId) {
     .sort((a, b) => a.username.localeCompare(b.username));
 }
 
-// ---------------------------------------------------------------------------
-// MESSAGES (1:1)
-// ---------------------------------------------------------------------------
 async function getMessagesBetween(idA, idB) {
   const rows = await messagesCol.find({
     $or: [
@@ -117,9 +113,6 @@ async function insertMessage({ sender_id, receiver_id, kind, numbers, image }) {
   return msg;
 }
 
-// ---------------------------------------------------------------------------
-// STATUSES
-// ---------------------------------------------------------------------------
 async function getStatuses(limit) {
   const rows = await statusesCol.find({}).sort({ id: -1 }).limit(limit || 100).toArray();
   const out = [];
@@ -135,9 +128,6 @@ async function insertStatus({ user_id, text, image }) {
   return status;
 }
 
-// ---------------------------------------------------------------------------
-// MEETINGS
-// ---------------------------------------------------------------------------
 async function getMeeting(pin) {
   return meetingsCol.findOne({ pin });
 }
@@ -158,7 +148,7 @@ async function insertMeetingMessage({ pin, sender_username, numbers }) {
 
 module.exports = {
   connect,
-  getUserByUsername, getUserById, createUser,
+  getUserByUsername, getUserById, createUser, updatePassword,
   addContactPair, getContacts,
   getMessagesBetween, insertMessage,
   getStatuses, insertStatus,
