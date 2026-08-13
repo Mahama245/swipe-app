@@ -197,6 +197,7 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
       <button class="nav-btn active" data-view="chats">💬 Chats</button>
       <button class="nav-btn" data-view="status">🌀 Status</button>
       <button class="nav-btn" data-view="meeting">🔒 Meeting</button>
+      <button class="nav-btn" data-view="admin" id="adminNavBtn" style="display:none;">🛠️ Admin</button>
     </nav>
 
     <div id="contactsSection">
@@ -220,6 +221,7 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
 let authMode = "login";
 let token = localStorage.getItem("swipe_token") || null;
 let myUsername = localStorage.getItem("swipe_username") || null;
+let isAdmin = false;
 let socket = null;
 
 document.querySelectorAll(".auth-tab").forEach(tab => {
@@ -268,6 +270,7 @@ async function submitAuth(){
     if (!res.ok){ showAuthError(data.error || "Something went wrong."); return; }
     token = data.token;
     myUsername = data.username;
+    isAdmin = !!data.isAdmin;
     localStorage.setItem("swipe_token", token);
     localStorage.setItem("swipe_username", myUsername);
     enterApp();
@@ -339,6 +342,7 @@ async function tryAutoLogin(){
     if (!res.ok) throw new Error("bad token");
     const data = await res.json();
     myUsername = data.username;
+    isAdmin = !!data.isAdmin;
     enterApp();
   }catch(e){
     localStorage.removeItem("swipe_token");
@@ -356,6 +360,7 @@ function enterApp(){
   document.getElementById("smoke").style.display = "";
   document.getElementById("app").style.display = "flex";
   document.getElementById("meLabel").textContent = "@" + myUsername;
+  document.getElementById("adminNavBtn").style.display = isAdmin ? "" : "none";
 
   socket = io({ auth: { token } });
   socket.on("chat:message", ({ message }) => {
@@ -681,9 +686,182 @@ document.querySelectorAll(".nav-btn").forEach(btn => {
     setActiveNav(btn.dataset.view);
     if (btn.dataset.view === "chats") showChatsView();
     else if (btn.dataset.view === "status") showStatusView();
+    else if (btn.dataset.view === "admin") showAdminView();
     else showMeetingView();
   });
 });
+
+// =====================================================================
+// ADMIN PANEL
+// =====================================================================
+async function showAdminView(){
+  currentView = "admin";
+  const main = document.getElementById("main");
+  main.innerHTML = `
+    <div class="view-header">
+      <h2>Admin — Users</h2>
+    </div>
+    <div id="adminUserList" class="status-list"></div>`;
+  loadAdminUsers();
+}
+
+async function loadAdminUsers(){
+  const list = document.getElementById("adminUserList");
+  list.innerHTML = `<div class="empty-state"><h3>Loading…</h3></div>`;
+  try{
+    const res = await fetch("/api/admin/users", { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok){ toast(data.error || "Couldn't load users.", true); return; }
+    renderAdminUserList(data.users || []);
+  }catch(e){ toast("Couldn't reach the server.", true); }
+}
+
+function renderAdminUserList(users){
+  const list = document.getElementById("adminUserList");
+  if (!list) return;
+  if (!users.length){
+    list.innerHTML = `<div class="empty-state"><h3>No users</h3></div>`;
+    return;
+  }
+  list.innerHTML = "";
+  users.forEach(u => list.appendChild(adminUserRowEl(u)));
+}
+
+function adminUserRowEl(u){
+  const row = document.createElement("div");
+  row.className = "status-card";
+  const banned = u.banned_until && new Date(u.banned_until) > new Date();
+  const lastLogin = u.last_login_at ? new Date(u.last_login_at).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "never";
+  row.innerHTML = `
+    <div style="flex:1;">
+      <div class="sauthor">@${escapeHtml(u.username)} ${u.is_admin ? "⭐" : ""} ${banned ? `<span style="color:#ff6b6b;">(banned until ${new Date(u.banned_until).toLocaleString([], { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })})</span>` : ""}</div>
+      <div class="stime">Last login: ${lastLogin}</div>
+      <div class="admin-actions" style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;"></div>
+    </div>`;
+  const actions = row.querySelector(".admin-actions");
+
+  if (u.username === myUsername){
+    const you = document.createElement("span");
+    you.className = "stime";
+    you.textContent = "(you)";
+    actions.appendChild(you);
+    return row;
+  }
+
+  if (banned){
+    const unbanBtn = document.createElement("button");
+    unbanBtn.className = "btn-secondary";
+    unbanBtn.textContent = "Unban";
+    unbanBtn.addEventListener("click", () => adminUnban(u.id));
+    actions.appendChild(unbanBtn);
+  } else {
+    const banBtn = document.createElement("button");
+    banBtn.className = "btn-secondary";
+    banBtn.textContent = "Ban";
+    banBtn.addEventListener("click", () => adminBanPrompt(u.id, u.username));
+    actions.appendChild(banBtn);
+  }
+
+  const pwBtn = document.createElement("button");
+  pwBtn.className = "btn-secondary";
+  pwBtn.textContent = "Reset Password";
+  pwBtn.addEventListener("click", () => adminResetPasswordPrompt(u.id, u.username));
+  actions.appendChild(pwBtn);
+
+  const delBtn = document.createElement("button");
+  delBtn.className = "btn-secondary";
+  delBtn.textContent = "Delete";
+  delBtn.addEventListener("click", () => adminDeletePrompt(u.id, u.username));
+  actions.appendChild(delBtn);
+
+  return row;
+}
+
+function adminBanPrompt(userId, username){
+  openModal({
+    title: `Ban @${username}`,
+    sub: "Enter how many hours the ban should last.",
+    fields: [{ id: "hours", label: "Duration (hours)", placeholder: "e.g. 24" }],
+    submitLabel: "Ban",
+    onSubmit: async (values) => {
+      const hours = Number(values.hours);
+      if (!hours || hours <= 0) return { error: "Enter a positive number of hours." };
+      try{
+        const res = await fetch(`/api/admin/users/${userId}/ban`, {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ hours })
+        });
+        const data = await res.json();
+        if (!res.ok) return { error: data.error || "Couldn't ban user." };
+        toast(`@${username} banned.`);
+        loadAdminUsers();
+      }catch(e){
+        return { error: "Couldn't reach the server." };
+      }
+    }
+  });
+}
+
+async function adminUnban(userId){
+  try{
+    const res = await fetch(`/api/admin/users/${userId}/unban`, {
+      method: "POST",
+      headers: authHeaders()
+    });
+    const data = await res.json();
+    if (!res.ok){ toast(data.error || "Couldn't unban user.", true); return; }
+    toast("User unbanned.");
+    loadAdminUsers();
+  }catch(e){ toast("Couldn't reach the server.", true); }
+}
+
+function adminResetPasswordPrompt(userId, username){
+  openModal({
+    title: `Reset password for @${username}`,
+    fields: [{ id: "newPassword", label: "New Password", type: "password", placeholder: "••••••••" }],
+    submitLabel: "Reset",
+    onSubmit: async (values) => {
+      const newPassword = values.newPassword || "";
+      if (newPassword.length < 6) return { error: "Password must be at least 6 characters." };
+      try{
+        const res = await fetch(`/api/admin/users/${userId}/password`, {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ newPassword })
+        });
+        const data = await res.json();
+        if (!res.ok) return { error: data.error || "Couldn't reset password." };
+        toast(`Password reset for @${username}.`);
+      }catch(e){
+        return { error: "Couldn't reach the server." };
+      }
+    }
+  });
+}
+
+function adminDeletePrompt(userId, username){
+  openModal({
+    title: `Delete @${username}?`,
+    sub: "This permanently removes the account, their contacts, messages, and statuses. This can't be undone.",
+    fields: [],
+    submitLabel: "Delete",
+    onSubmit: async () => {
+      try{
+        const res = await fetch(`/api/admin/users/${userId}`, {
+          method: "DELETE",
+          headers: authHeaders()
+        });
+        const data = await res.json();
+        if (!res.ok) return { error: data.error || "Couldn't delete user." };
+        toast(`@${username} deleted.`);
+        loadAdminUsers();
+      }catch(e){
+        return { error: "Couldn't reach the server." };
+      }
+    }
+  });
+}
 document.getElementById("addContactBtn").addEventListener("click", () => {
   openModal({
     title: "Add Contact",
