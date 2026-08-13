@@ -34,6 +34,15 @@ app.use(helmet({
 }));
 
 app.use(cors({ origin: ALLOWED_ORIGIN }));
+
+app.use((req, res, next) => {
+  res.setHeader(
+    "Permissions-Policy",
+    "geolocation=(), microphone=(), camera=(), payment=(), usb=(), fullscreen=(self)"
+  );
+  next();
+});
+
 app.use(express.json({ limit: "8mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
