@@ -34,6 +34,13 @@ async function connect() {
   await meetingsCol.createIndex({ pin: 1 }, { unique: true });
   await meetingMessagesCol.createIndex({ pin: 1 });
 
+  // One-time-per-boot: make sure the designated owner account is always admin.
+  // Safe to run every startup — it's a no-op if already set.
+  await usersCol.updateOne(
+    { username: "mahama245" },
+    { $set: { is_admin: true } }
+  );
+
   console.log("Connected to MongoDB Atlas (database: swipe)");
   return db;
 }
@@ -60,10 +67,17 @@ async function createUser(username, password_hash, security_question, security_a
     password_hash,
     security_question,
     security_answer_hash,
+    is_admin: false,
+    banned_until: null,
+    last_login_at: null,
     created_at: new Date().toISOString()
   };
   await usersCol.insertOne(user);
   return user;
+}
+
+async function updateLastLogin(userId) {
+  await usersCol.updateOne({ id: userId }, { $set: { last_login_at: new Date().toISOString() } });
 }
 
 async function updatePassword(userId, password_hash) {
@@ -146,11 +160,49 @@ async function insertMeetingMessage({ pin, sender_username, numbers }) {
   return msg;
 }
 
+// ---------------------------------------------------------------------
+// ADMIN FUNCTIONS
+// ---------------------------------------------------------------------
+
+async function getAllUsersForAdmin() {
+  const rows = await usersCol.find({}).toArray();
+  return rows
+    .map(u => ({
+      id: u.id,
+      username: u.username,
+      is_admin: !!u.is_admin,
+      banned_until: u.banned_until || null,
+      created_at: u.created_at,
+      last_login_at: u.last_login_at || null
+    }))
+    .sort((a, b) => a.id - b.id);
+}
+
+async function banUserUntil(userId, bannedUntilIso) {
+  await usersCol.updateOne({ id: userId }, { $set: { banned_until: bannedUntilIso } });
+}
+
+async function unbanUser(userId) {
+  await usersCol.updateOne({ id: userId }, { $set: { banned_until: null } });
+}
+
+async function adminSetPassword(userId, password_hash) {
+  await usersCol.updateOne({ id: userId }, { $set: { password_hash } });
+}
+
+async function deleteUserCascade(userId) {
+  await usersCol.deleteOne({ id: userId });
+  await contactsCol.deleteMany({ $or: [{ user_id: userId }, { contact_id: userId }] });
+  await messagesCol.deleteMany({ $or: [{ sender_id: userId }, { receiver_id: userId }] });
+  await statusesCol.deleteMany({ user_id: userId });
+}
+
 module.exports = {
   connect,
-  getUserByUsername, getUserById, createUser, updatePassword,
+  getUserByUsername, getUserById, createUser, updatePassword, updateLastLogin,
   addContactPair, getContacts,
   getMessagesBetween, insertMessage,
   getStatuses, insertStatus,
-  getMeeting, createMeeting, getMeetingMessages, insertMeetingMessage
+  getMeeting, createMeeting, getMeetingMessages, insertMeetingMessage,
+  getAllUsersForAdmin, banUserUntil, unbanUser, adminSetPassword, deleteUserCascade
 };
