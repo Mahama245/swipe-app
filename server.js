@@ -25,8 +25,9 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'", "https://cdnjs.cloudflare.com", "https://cdn.socket.io"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com"],
       imgSrc: ["'self'", "data:"],
       connectSrc: ["'self'", ALLOWED_ORIGIN, ALLOWED_ORIGIN.replace("https://", "wss://")]
     }
@@ -90,18 +91,29 @@ function clearFailedLogins(username) {
   failedLogins.delete(username);
 }
 
-function authMiddleware(req, res, next) {
+async function authMiddleware(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "Missing token." });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    req.userId = payload.uid;
-    req.username = payload.username;
+    const user = await db.getUserById(payload.uid);
+    if (!user) return res.status(401).json({ error: "Account no longer exists." });
+    if (user.banned_until && new Date(user.banned_until) > new Date()) {
+      return res.status(403).json({ error: "This account has been suspended." });
+    }
+    req.userId = user.id;
+    req.username = user.username;
+    req.isAdmin = !!user.is_admin;
     next();
   } catch (e) {
     return res.status(401).json({ error: "Invalid or expired token." });
   }
+}
+
+function adminMiddleware(req, res, next) {
+  if (!req.isAdmin) return res.status(403).json({ error: "Admins only." });
+  next();
 }
 
 function safe(handler) {
@@ -133,9 +145,18 @@ app.post("/api/login", authLimiter, safe(async (req, res) => {
     return res.status(401).json({ error: "Invalid username or password." });
   }
 
+  if (user.banned_until && new Date(user.banned_until) > new Date()) {
+    return res.status(403).json({ error: "This account has been suspended." });
+  }
+
   clearFailedLogins(clean);
+  await db.updateLastLogin(user.id);
   const token = jwt.sign({ uid: user.id, username: user.username }, JWT_SECRET, { expiresIn: "30d" });
-  res.json({ token, username: user.username });
+  res.json({ token, username: user.username, isAdmin: !!user.is_admin });
+}));
+
+app.get("/api/me", authMiddleware, safe(async (req, res) => {
+  res.json({ username: req.username, isAdmin: req.isAdmin });
 }));
 
 app.post("/api/register", authLimiter, safe(async (req, res) => {
@@ -297,6 +318,62 @@ app.post("/api/meetings/:pin/messages", authMiddleware, writeLimiter, safe(async
   const saved = await db.insertMeetingMessage({ pin: req.params.pin, sender_username: req.username, numbers });
   io.to(`meeting:${req.params.pin}`).emit("meeting:message", saved);
   res.json({ message: saved });
+}));
+
+// ---------------------------------------------------------------------
+// ADMIN
+// ---------------------------------------------------------------------
+
+app.get("/api/admin/users", authMiddleware, adminMiddleware, safe(async (req, res) => {
+  res.json({ users: await db.getAllUsersForAdmin() });
+}));
+
+app.post("/api/admin/users/:id/ban", authMiddleware, adminMiddleware, safe(async (req, res) => {
+  const targetId = Number(req.params.id);
+  if (targetId === req.userId) return res.status(400).json({ error: "You can't ban yourself." });
+
+  const target = await db.getUserById(targetId);
+  if (!target) return res.status(404).json({ error: "User not found." });
+
+  const hours = Number(req.body?.hours);
+  if (!hours || hours <= 0) return res.status(400).json({ error: "Provide a positive number of hours." });
+
+  const bannedUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+  await db.banUserUntil(targetId, bannedUntil);
+  res.json({ ok: true, banned_until: bannedUntil });
+}));
+
+app.post("/api/admin/users/:id/unban", authMiddleware, adminMiddleware, safe(async (req, res) => {
+  const targetId = Number(req.params.id);
+  const target = await db.getUserById(targetId);
+  if (!target) return res.status(404).json({ error: "User not found." });
+  await db.unbanUser(targetId);
+  res.json({ ok: true });
+}));
+
+app.post("/api/admin/users/:id/password", authMiddleware, adminMiddleware, safe(async (req, res) => {
+  const targetId = Number(req.params.id);
+  const target = await db.getUserById(targetId);
+  if (!target) return res.status(404).json({ error: "User not found." });
+
+  const { newPassword } = req.body || {};
+  if (!newPassword || newPassword.length < 6) {
+    return res.status(400).json({ error: "New password must be at least 6 characters." });
+  }
+  const password_hash = bcrypt.hashSync(newPassword, 10);
+  await db.adminSetPassword(targetId, password_hash);
+  res.json({ ok: true });
+}));
+
+app.delete("/api/admin/users/:id", authMiddleware, adminMiddleware, safe(async (req, res) => {
+  const targetId = Number(req.params.id);
+  if (targetId === req.userId) return res.status(400).json({ error: "You can't delete your own account." });
+
+  const target = await db.getUserById(targetId);
+  if (!target) return res.status(404).json({ error: "User not found." });
+
+  await db.deleteUserCascade(targetId);
+  res.json({ ok: true });
 }));
 
 io.use((socket, next) => {
