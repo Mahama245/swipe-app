@@ -3,21 +3,58 @@ const express = require("express");
 const http = require("http");
 const path = require("path");
 const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { Server } = require("socket.io");
 const db = require("./db");
 
-const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-in-production";
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error("FATAL: JWT_SECRET is not set. Set it in Render's environment variables before starting the server.");
+  process.exit(1);
+}
+
 const PORT = process.env.PORT || 3000;
+const ALLOWED_ORIGIN = "https://swipe-app-wzqp.onrender.com";
 
 const app = express();
-app.use(cors());
+
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:"],
+      connectSrc: ["'self'", ALLOWED_ORIGIN, ALLOWED_ORIGIN.replace("https://", "wss://")]
+    }
+  }
+}));
+
+app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.json({ limit: "8mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+const io = new Server(server, { cors: { origin: ALLOWED_ORIGIN } });
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many attempts from this device. Please wait a while and try again." }
+});
+
+const writeLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "You're sending requests too quickly. Please slow down." }
+});
 
 const MAX_ATTEMPTS = 5;
 const LOCKOUT_MS = 15 * 60 * 1000;
@@ -65,7 +102,9 @@ function safe(handler) {
       res.status(500).json({ error: "Server error." });
     });
   };
-}app.post("/api/login", safe(async (req, res) => {
+}
+
+app.post("/api/login", authLimiter, safe(async (req, res) => {
   const { username, password } = req.body || {};
   const clean = (username || "").trim().toLowerCase();
 
@@ -90,7 +129,7 @@ function safe(handler) {
   res.json({ token, username: user.username });
 }));
 
-app.post("/api/register", safe(async (req, res) => {
+app.post("/api/register", authLimiter, safe(async (req, res) => {
   const { username, password, securityQuestion, securityAnswer } = req.body || {};
   const clean = (username || "").trim().toLowerCase();
 
@@ -119,14 +158,15 @@ app.post("/api/register", safe(async (req, res) => {
   const token = jwt.sign({ uid: user.id, username: user.username }, JWT_SECRET, { expiresIn: "30d" });
   res.json({ token, username: user.username });
 }));
-app.get("/api/forgot-password/:username", safe(async (req, res) => {
+
+app.get("/api/forgot-password/:username", authLimiter, safe(async (req, res) => {
   const clean = (req.params.username || "").trim().toLowerCase();
   const user = await db.getUserByUsername(clean);
   if (!user) return res.status(404).json({ error: "No account with that username." });
   res.json({ question: user.security_question });
 }));
 
-app.post("/api/forgot-password/reset", safe(async (req, res) => {
+app.post("/api/forgot-password/reset", authLimiter, safe(async (req, res) => {
   const { username, answer, newPassword } = req.body || {};
   const clean = (username || "").trim().toLowerCase();
   const user = await db.getUserByUsername(clean);
@@ -182,7 +222,7 @@ app.get("/api/messages/:username", authMiddleware, safe(async (req, res) => {
   res.json({ messages: out });
 }));
 
-app.post("/api/messages", authMiddleware, safe(async (req, res) => {
+app.post("/api/messages", authMiddleware, writeLimiter, safe(async (req, res) => {
   const { to, numbers, kind, image } = req.body || {};
   const other = await db.getUserByUsername((to || "").trim().toLowerCase());
   if (!other) return res.status(404).json({ error: "Recipient not found." });
@@ -205,11 +245,12 @@ app.post("/api/messages", authMiddleware, safe(async (req, res) => {
   io.to(roomFor(req.userId, other.id)).emit("chat:message", { withUserId: req.userId, message: payload });
   res.json({ message: payload });
 }));
+
 app.get("/api/statuses", authMiddleware, safe(async (req, res) => {
   res.json({ statuses: await db.getStatuses(100) });
 }));
 
-app.post("/api/statuses", authMiddleware, safe(async (req, res) => {
+app.post("/api/statuses", authMiddleware, writeLimiter, safe(async (req, res) => {
   const { text, image } = req.body || {};
   if (!text || !text.trim()) return res.status(400).json({ error: "Status text required." });
   const saved = await db.insertStatus({ user_id: req.userId, text: text.trim(), image });
@@ -226,7 +267,7 @@ app.post("/api/meetings", authMiddleware, safe(async (req, res) => {
   res.json({ pin: clean });
 }));
 
-app.post("/api/meetings/:pin/join", authMiddleware, safe(async (req, res) => {
+app.post("/api/meetings/:pin/join", authMiddleware, authLimiter, safe(async (req, res) => {
   const meeting = await db.getMeeting(req.params.pin);
   if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
   res.json({ pin: meeting.pin });
@@ -238,7 +279,7 @@ app.get("/api/meetings/:pin/messages", authMiddleware, safe(async (req, res) => 
   res.json({ messages: await db.getMeetingMessages(req.params.pin) });
 }));
 
-app.post("/api/meetings/:pin/messages", authMiddleware, safe(async (req, res) => {
+app.post("/api/meetings/:pin/messages", authMiddleware, writeLimiter, safe(async (req, res) => {
   const { numbers } = req.body || {};
   const meeting = await db.getMeeting(req.params.pin);
   if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
