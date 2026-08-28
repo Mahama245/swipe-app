@@ -1,104 +1,181 @@
-// db.js — MongoDB Atlas backed database layer for SWIPE.
-// Replaces the old JSON-file version. All functions are now ASYNC
-// (they return Promises), because talking to MongoDB is asynchronous.
-// server.js has been updated to `await` every call into this file.
+// db.js — MongoDB-backed persistence (MongoDB Atlas free tier).
+// Replaces the old JSON-file database, which reset every time Render
+// restarted the server (Render's free tier disk is NOT persistent —
+// that was the "friends disappear on re-login" bug).
+//
+// Also stores WebAuthn (Face ID / fingerprint / Windows Hello) credentials
+// per user, for biometric login.
+//
+// All functions below are ASYNC (return Promises) — server.js awaits them.
 
-const { MongoClient } = require("mongodb");
+const mongoose = require("mongoose");
 
 const MONGODB_URI = process.env.MONGODB_URI;
+
 if (!MONGODB_URI) {
-  throw new Error("MONGODB_URI is not set. Add it to your .env file (local) or Render environment variables (production).");
+  console.error("FATAL: MONGODB_URI environment variable is not set.");
+  console.error("Set it in your .env file locally, or in Render's Environment tab.");
+  process.exit(1);
 }
 
-const client = new MongoClient(MONGODB_URI);
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log("Connected to MongoDB."))
+  .catch(err => {
+    console.error("MongoDB connection failed:", err.message);
+    process.exit(1);
+  });
 
-let db = null;
-let usersCol, contactsCol, messagesCol, statusesCol, meetingsCol, meetingMessagesCol, countersCol;
+// ---------------------------------------------------------------------------
+// SCHEMAS
+// ---------------------------------------------------------------------------
+const CounterSchema = new mongoose.Schema({
+  _id: String,
+  seq: { type: Number, default: 0 }
+});
+const Counter = mongoose.model("Counter", CounterSchema);
 
-async function connect() {
-  if (db) return db;
-  await client.connect();
-  db = client.db("swipe");
+const UserSchema = new mongoose.Schema({
+  id: { type: Number, unique: true },
+  username: { type: String, unique: true, index: true },
+  password_hash: String,
+  is_admin: { type: Boolean, default: false },
+  created_at: { type: Date, default: Date.now }
+});
+const User = mongoose.model("User", UserSchema);
 
-  usersCol = db.collection("users");
-  contactsCol = db.collection("contacts");
-  messagesCol = db.collection("messages");
-  statusesCol = db.collection("statuses");
-  meetingsCol = db.collection("meetings");
-  meetingMessagesCol = db.collection("meeting_messages");
-  countersCol = db.collection("counters");
+const ContactSchema = new mongoose.Schema({
+  user_id: Number,
+  contact_id: Number,
+  created_at: { type: Date, default: Date.now }
+});
+const Contact = mongoose.model("Contact", ContactSchema);
 
-  await usersCol.createIndex({ username: 1 }, { unique: true });
-  await contactsCol.createIndex({ user_id: 1, contact_id: 1 }, { unique: true });
-  await messagesCol.createIndex({ sender_id: 1, receiver_id: 1 });
-  await meetingsCol.createIndex({ pin: 1 }, { unique: true });
-  await meetingMessagesCol.createIndex({ pin: 1 });
+const MessageSchema = new mongoose.Schema({
+  id: { type: Number, unique: true },
+  sender_id: Number,
+  receiver_id: Number,
+  kind: String,
+  numbers: mongoose.Schema.Types.Mixed,
+  image: String,
+  created_at: { type: Date, default: Date.now }
+});
+const Message = mongoose.model("Message", MessageSchema);
 
-  // One-time-per-boot: make sure the designated owner account is always admin.
-  // Safe to run every startup — it's a no-op if already set.
-  await usersCol.updateOne(
-    { username: "mahama245" },
-    { $set: { is_admin: true } }
-  );
+const StatusSchema = new mongoose.Schema({
+  id: { type: Number, unique: true },
+  user_id: Number,
+  text: String,
+  image: String,
+  created_at: { type: Date, default: Date.now }
+});
+const Status = mongoose.model("Status", StatusSchema);
 
-  console.log("Connected to MongoDB Atlas (database: swipe)");
-  return db;
-}
+const MeetingSchema = new mongoose.Schema({
+  pin: { type: String, unique: true },
+  host_id: Number,
+  status: { type: String, enum: ["OPEN", "CLOSED"], default: "OPEN" },
+  closed_at: { type: Date, default: null },
+  closed_by: { type: Number, default: null },
+  // Usernames granted access back into a CLOSED meeting via an approved
+  // request. The host does NOT automatically keep access after closing —
+  // once closed, only an admin has standing access; everyone else
+  // (including the original host) must request it again, same as anyone.
+  approved_usernames: { type: [String], default: [] },
+  created_at: { type: Date, default: Date.now }
+});
+const Meeting = mongoose.model("Meeting", MeetingSchema);
 
+const MeetingAccessRequestSchema = new mongoose.Schema({
+  id: { type: Number, unique: true },
+  pin: String,
+  requester_id: Number,
+  requester_username: String,
+  status: { type: String, enum: ["PENDING", "APPROVED", "DENIED"], default: "PENDING" },
+  created_at: { type: Date, default: Date.now },
+  resolved_at: { type: Date, default: null },
+  resolved_by: { type: Number, default: null }
+});
+const MeetingAccessRequest = mongoose.model("MeetingAccessRequest", MeetingAccessRequestSchema);
+
+const MeetingMessageSchema = new mongoose.Schema({
+  id: { type: Number, unique: true },
+  pin: String,
+  sender_username: String,
+  numbers: mongoose.Schema.Types.Mixed,
+  created_at: { type: Date, default: Date.now }
+});
+const MeetingMessage = mongoose.model("MeetingMessage", MeetingMessageSchema);
+
+// WebAuthn credentials (Face ID / fingerprint / Windows Hello).
+// The server NEVER sees biometric data — only a public key + counter.
+const AuthenticatorSchema = new mongoose.Schema({
+  user_id: { type: Number, index: true },
+  credential_id: { type: String, unique: true }, // base64url
+  public_key: String,                             // base64url
+  counter: { type: Number, default: 0 },
+  device_type: String,
+  backed_up: Boolean,
+  transports: [String],
+  nickname: String,                                // e.g. "Mahama's iPhone"
+  created_at: { type: Date, default: Date.now }
+});
+const Authenticator = mongoose.model("Authenticator", AuthenticatorSchema);
+
+// temporary storage for in-flight WebAuthn challenges — TTL index auto-cleans
+const ChallengeSchema = new mongoose.Schema({
+  user_id: { type: Number, index: true },
+  challenge: String,
+  created_at: { type: Date, default: Date.now, expires: 300 } // auto-delete after 5 min
+});
+const Challenge = mongoose.model("Challenge", ChallengeSchema);
+
+// ---------------------------------------------------------------------------
+// ID COUNTERS (mimics the old auto-increment behaviour)
+// ---------------------------------------------------------------------------
 async function nextId(kind) {
-  const result = await countersCol.findOneAndUpdate(
-    { _id: kind },
+  const doc = await Counter.findByIdAndUpdate(
+    kind,
     { $inc: { seq: 1 } },
-    { upsert: true, returnDocument: "after" }
+    { new: true, upsert: true }
   );
-  return result.seq;
+  return doc.seq;
 }
 
+// ---------------------------------------------------------------------------
+// USERS
+// ---------------------------------------------------------------------------
 async function getUserByUsername(username) {
-  return usersCol.findOne({ username });
+  return User.findOne({ username }).lean();
 }
 async function getUserById(id) {
-  return usersCol.findOne({ id });
+  return User.findOne({ id }).lean();
 }
-async function createUser(username, password_hash, security_question, security_answer_hash) {
-  const user = {
-    id: await nextId("user"),
-    username,
-    password_hash,
-    security_question,
-    security_answer_hash,
-    is_admin: false,
-    banned_until: null,
-    last_login_at: null,
-    created_at: new Date().toISOString()
-  };
-  await usersCol.insertOne(user);
-  return user;
+async function createUser(username, password_hash) {
+  const id = await nextId("user");
+  const user = await User.create({ id, username, password_hash });
+  return user.toObject();
 }
 
-async function updateLastLogin(userId) {
-  await usersCol.updateOne({ id: userId }, { $set: { last_login_at: new Date().toISOString() } });
+// Ensures the designated bootstrap admin username always has admin rights,
+// even if their account was created before this feature existed. Called on
+// every login rather than only at signup so it's self-healing.
+async function ensureBootstrapAdmin(username) {
+  const bootstrapUsername = (process.env.BOOTSTRAP_ADMIN_USERNAME || "mahama245").toLowerCase();
+  if (username !== bootstrapUsername) return;
+  await User.updateOne({ username }, { is_admin: true });
 }
 
-async function updatePassword(userId, password_hash) {
-  await usersCol.updateOne({ id: userId }, { $set: { password_hash } });
-}
-
+// ---------------------------------------------------------------------------
+// CONTACTS (mutual)
+// ---------------------------------------------------------------------------
 async function addContactPair(userId, contactId) {
-  const now = new Date().toISOString();
-  await contactsCol.updateOne(
-    { user_id: userId, contact_id: contactId },
-    { $setOnInsert: { user_id: userId, contact_id: contactId, created_at: now } },
-    { upsert: true }
-  );
-  await contactsCol.updateOne(
-    { user_id: contactId, contact_id: userId },
-    { $setOnInsert: { user_id: contactId, contact_id: userId, created_at: now } },
-    { upsert: true }
-  );
+  const exists1 = await Contact.findOne({ user_id: userId, contact_id: contactId });
+  if (!exists1) await Contact.create({ user_id: userId, contact_id: contactId });
+  const exists2 = await Contact.findOne({ user_id: contactId, contact_id: userId });
+  if (!exists2) await Contact.create({ user_id: contactId, contact_id: userId });
 }
 async function getContacts(userId) {
-  const rows = await contactsCol.find({ user_id: userId }).toArray();
+  const rows = await Contact.find({ user_id: userId }).lean();
   const users = await Promise.all(rows.map(c => getUserById(c.contact_id)));
   return users
     .filter(Boolean)
@@ -106,103 +183,147 @@ async function getContacts(userId) {
     .sort((a, b) => a.username.localeCompare(b.username));
 }
 
+// ---------------------------------------------------------------------------
+// MESSAGES (1:1)
+// ---------------------------------------------------------------------------
 async function getMessagesBetween(idA, idB) {
-  const rows = await messagesCol.find({
+  return Message.find({
     $or: [
       { sender_id: idA, receiver_id: idB },
       { sender_id: idB, receiver_id: idA }
     ]
-  }).toArray();
-  return rows.sort((a, b) => a.id - b.id);
+  }).sort({ id: 1 }).lean();
 }
 async function insertMessage({ sender_id, receiver_id, kind, numbers, image }) {
-  const msg = {
-    id: await nextId("message"),
-    sender_id, receiver_id, kind,
+  const id = await nextId("message");
+  const msg = await Message.create({
+    id, sender_id, receiver_id, kind,
     numbers: numbers || null,
-    image: image || null,
-    created_at: new Date().toISOString()
-  };
-  await messagesCol.insertOne(msg);
-  return msg;
+    image: image || null
+  });
+  return msg.toObject();
 }
 
+// ---------------------------------------------------------------------------
+// STATUSES
+// ---------------------------------------------------------------------------
 async function getStatuses(limit) {
-  const rows = await statusesCol.find({}).sort({ id: -1 }).limit(limit || 100).toArray();
-  const out = [];
-  for (const s of rows) {
-    const u = await getUserById(s.user_id);
-    out.push({ ...s, username: u?.username || "unknown" });
-  }
-  return out;
+  const rows = await Status.find().sort({ id: -1 }).limit(limit || 100).lean();
+  return Promise.all(rows.map(async s => ({
+    ...s,
+    username: (await getUserById(s.user_id))?.username || "unknown"
+  })));
 }
 async function insertStatus({ user_id, text, image }) {
-  const status = { id: await nextId("status"), user_id, text, image: image || null, created_at: new Date().toISOString() };
-  await statusesCol.insertOne(status);
-  return status;
+  const id = await nextId("status");
+  const status = await Status.create({ id, user_id, text, image: image || null });
+  return status.toObject();
 }
 
+// ---------------------------------------------------------------------------
+// MEETINGS
+// ---------------------------------------------------------------------------
 async function getMeeting(pin) {
-  return meetingsCol.findOne({ pin });
+  return Meeting.findOne({ pin }).lean();
 }
 async function createMeeting(pin, host_id) {
-  const meeting = { pin, host_id, created_at: new Date().toISOString() };
-  await meetingsCol.insertOne(meeting);
-  return meeting;
+  const meeting = await Meeting.create({ pin, host_id });
+  return meeting.toObject();
+}
+async function closeMeeting(pin, closed_by) {
+  const meeting = await Meeting.findOneAndUpdate(
+    { pin },
+    { status: "CLOSED", closed_at: new Date(), closed_by, approved_usernames: [] },
+    { new: true }
+  );
+  return meeting ? meeting.toObject() : null;
+}
+// True if this user may currently get into the meeting: it's still open,
+// they're an admin, or they were specifically approved back in after a
+// closure. The original host does NOT get automatic access back — once
+// closed, they're treated the same as anyone else and must request access.
+async function canAccessMeeting(meeting, username, isAdmin) {
+  if (isAdmin) return true;
+  if (meeting.status === "OPEN") return true;
+  return (meeting.approved_usernames || []).includes(username);
 }
 async function getMeetingMessages(pin) {
-  const rows = await meetingMessagesCol.find({ pin }).toArray();
-  return rows.sort((a, b) => a.id - b.id);
+  return MeetingMessage.find({ pin }).sort({ id: 1 }).lean();
 }
 async function insertMeetingMessage({ pin, sender_username, numbers }) {
-  const msg = { id: await nextId("meeting_message"), pin, sender_username, numbers, created_at: new Date().toISOString() };
-  await meetingMessagesCol.insertOne(msg);
-  return msg;
+  const id = await nextId("meeting_message");
+  const msg = await MeetingMessage.create({ id, pin, sender_username, numbers });
+  return msg.toObject();
 }
 
-// ---------------------------------------------------------------------
-// ADMIN FUNCTIONS
-// ---------------------------------------------------------------------
-
-async function getAllUsersForAdmin() {
-  const rows = await usersCol.find({}).toArray();
-  return rows
-    .map(u => ({
-      id: u.id,
-      username: u.username,
-      is_admin: !!u.is_admin,
-      banned_until: u.banned_until || null,
-      created_at: u.created_at,
-      last_login_at: u.last_login_at || null
-    }))
-    .sort((a, b) => a.id - b.id);
+// ---------------------------------------------------------------------------
+// MEETING ACCESS REQUESTS
+// ---------------------------------------------------------------------------
+async function createAccessRequest(pin, requester_id, requester_username) {
+  const existing = await MeetingAccessRequest.findOne({ pin, requester_username, status: "PENDING" });
+  if (existing) return existing.toObject();
+  const id = await nextId("meeting_access_request");
+  const request = await MeetingAccessRequest.create({ id, pin, requester_id, requester_username });
+  return request.toObject();
+}
+async function getPendingAccessRequests() {
+  return MeetingAccessRequest.find({ status: "PENDING" }).sort({ created_at: -1 }).lean();
+}
+async function resolveAccessRequest(id, approve, resolved_by) {
+  const request = await MeetingAccessRequest.findOne({ id });
+  if (!request) return null;
+  request.status = approve ? "APPROVED" : "DENIED";
+  request.resolved_at = new Date();
+  request.resolved_by = resolved_by;
+  await request.save();
+  if (approve) {
+    await Meeting.updateOne({ pin: request.pin }, { $addToSet: { approved_usernames: request.requester_username } });
+  }
+  return request.toObject();
 }
 
-async function banUserUntil(userId, bannedUntilIso) {
-  await usersCol.updateOne({ id: userId }, { $set: { banned_until: bannedUntilIso } });
+// ---------------------------------------------------------------------------
+// WEBAUTHN (biometric login)
+// ---------------------------------------------------------------------------
+async function saveChallenge(user_id, challenge) {
+  await Challenge.deleteMany({ user_id: user_id ?? null });
+  await Challenge.create({ user_id: user_id ?? null, challenge });
 }
-
-async function unbanUser(userId) {
-  await usersCol.updateOne({ id: userId }, { $set: { banned_until: null } });
+async function getChallenge(user_id) {
+  const row = await Challenge.findOne({ user_id: user_id ?? null }).sort({ created_at: -1 }).lean();
+  return row ? row.challenge : null;
 }
-
-async function adminSetPassword(userId, password_hash) {
-  await usersCol.updateOne({ id: userId }, { $set: { password_hash } });
+async function clearChallenge(user_id) {
+  await Challenge.deleteMany({ user_id: user_id ?? null });
 }
-
-async function deleteUserCascade(userId) {
-  await usersCol.deleteOne({ id: userId });
-  await contactsCol.deleteMany({ $or: [{ user_id: userId }, { contact_id: userId }] });
-  await messagesCol.deleteMany({ $or: [{ sender_id: userId }, { receiver_id: userId }] });
-  await statusesCol.deleteMany({ user_id: userId });
+async function addAuthenticator({ user_id, credential_id, public_key, counter, device_type, backed_up, transports, nickname }) {
+  const auth = await Authenticator.create({
+    user_id, credential_id, public_key, counter,
+    device_type, backed_up, transports: transports || [], nickname: nickname || "This device"
+  });
+  return auth.toObject();
+}
+async function getAuthenticatorsByUser(user_id) {
+  return Authenticator.find({ user_id }).lean();
+}
+async function getAuthenticatorByCredentialId(credential_id) {
+  return Authenticator.findOne({ credential_id }).lean();
+}
+async function updateAuthenticatorCounter(credential_id, counter) {
+  await Authenticator.updateOne({ credential_id }, { counter });
+}
+async function deleteAuthenticator(user_id, credential_id) {
+  await Authenticator.deleteOne({ user_id, credential_id });
 }
 
 module.exports = {
-  connect,
-  getUserByUsername, getUserById, createUser, updatePassword, updateLastLogin,
+  getUserByUsername, getUserById, createUser, ensureBootstrapAdmin,
   addContactPair, getContacts,
   getMessagesBetween, insertMessage,
   getStatuses, insertStatus,
-  getMeeting, createMeeting, getMeetingMessages, insertMeetingMessage,
-  getAllUsersForAdmin, banUserUntil, unbanUser, adminSetPassword, deleteUserCascade
+  getMeeting, createMeeting, closeMeeting, canAccessMeeting, getMeetingMessages, insertMeetingMessage,
+  createAccessRequest, getPendingAccessRequests, resolveAccessRequest,
+  saveChallenge, getChallenge, clearChallenge,
+  addAuthenticator, getAuthenticatorsByUser, getAuthenticatorByCredentialId,
+  updateAuthenticatorCounter, deleteAuthenticator
 };

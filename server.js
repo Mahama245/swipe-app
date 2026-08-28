@@ -3,219 +3,223 @@ const express = require("express");
 const http = require("http");
 const path = require("path");
 const cors = require("cors");
-const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { Server } = require("socket.io");
+const {
+  generateRegistrationOptions, verifyRegistrationResponse,
+  generateAuthenticationOptions, verifyAuthenticationResponse
+} = require("@simplewebauthn/server");
 const db = require("./db");
 
-const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) {
-  console.error("FATAL: JWT_SECRET is not set. Set it in Render's environment variables before starting the server.");
-  process.exit(1);
-}
-
+const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-in-production";
 const PORT = process.env.PORT || 3000;
-const ALLOWED_ORIGIN = "https://swipe-app-wzqp.onrender.com";
+
+// WebAuthn needs to know the domain it's running on. Set RP_ID to your bare
+// domain (e.g. "swipe-app-wzqp.onrender.com") in production via env var.
+// Falls back to localhost for local testing.
+const RP_NAME = "SWIPE";
+const RP_ID = process.env.RP_ID || "localhost";
+const ORIGIN = process.env.ORIGIN || `http://localhost:${PORT}`;
 
 const app = express();
-
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com", "https://cdn.socket.io"],
-      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
-      fontSrc: ["'self'", "https://fonts.gstatic.com"],
-      imgSrc: ["'self'", "data:"],
-      connectSrc: ["'self'", ALLOWED_ORIGIN, ALLOWED_ORIGIN.replace("https://", "wss://")]
-    }
-  }
-}));
-
-app.use(cors({ origin: ALLOWED_ORIGIN }));
-
-app.use((req, res, next) => {
-  res.setHeader(
-    "Permissions-Policy",
-    "geolocation=(), microphone=(), camera=(), payment=(), usb=(), fullscreen=(self)"
-  );
-  next();
-});
-
+app.use(cors());
 app.use(express.json({ limit: "8mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: ALLOWED_ORIGIN } });
+const io = new Server(server, { cors: { origin: "*" } });
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many attempts from this device. Please wait a while and try again." }
-});
-
-const writeLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "You're sending requests too quickly. Please slow down." }
-});
-
-const MAX_ATTEMPTS = 5;
-const LOCKOUT_MS = 15 * 60 * 1000;
-const failedLogins = new Map();
-
-function getLoginState(username) {
-  return failedLogins.get(username) || { attempts: 0, lockedUntil: 0 };
-}
-
-function recordFailedLogin(username) {
-  const state = getLoginState(username);
-  state.attempts += 1;
-  let justLocked = false;
-  if (state.attempts >= MAX_ATTEMPTS) {
-    state.lockedUntil = Date.now() + LOCKOUT_MS;
-    state.attempts = 0;
-    justLocked = true;
-  }
-  failedLogins.set(username, state);
-  return justLocked;
-}
-
-function clearFailedLogins(username) {
-  failedLogins.delete(username);
-}
-
-async function authMiddleware(req, res, next) {
+function authMiddleware(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "Missing token." });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = await db.getUserById(payload.uid);
-    if (!user) return res.status(401).json({ error: "Account no longer exists." });
-    if (user.banned_until && new Date(user.banned_until) > new Date()) {
-      return res.status(403).json({ error: "This account has been suspended." });
-    }
-    req.userId = user.id;
-    req.username = user.username;
-    req.isAdmin = !!user.is_admin;
+    req.userId = payload.uid;
+    req.username = payload.username;
     next();
   } catch (e) {
     return res.status(401).json({ error: "Invalid or expired token." });
   }
 }
 
-function adminMiddleware(req, res, next) {
-  if (!req.isAdmin) return res.status(403).json({ error: "Admins only." });
-  next();
+// Must run AFTER authMiddleware. Re-checks admin status from the database
+// on every request rather than trusting anything baked into the JWT, so a
+// demotion takes effect immediately rather than only after the token expires.
+function requireAdmin(req, res, next) {
+  db.getUserById(req.userId)
+    .then(user => {
+      if (!user || !user.is_admin) return res.status(403).json({ error: "Admin access required." });
+      next();
+    })
+    .catch(() => res.status(500).json({ error: "Server error checking admin access." }));
 }
 
 function safe(handler) {
-  return (req, res) => {
-    Promise.resolve(handler(req, res)).catch(err => {
-      console.error(err);
-      res.status(500).json({ error: "Server error." });
-    });
-  };
+  return (req, res) => handler(req, res).catch(err => {
+    console.error(err);
+    res.status(500).json({ error: "Server error. Please try again." });
+  });
 }
 
-app.post("/api/login", authLimiter, safe(async (req, res) => {
+function issueToken(user) {
+  return jwt.sign({ uid: user.id, username: user.username }, JWT_SECRET, { expiresIn: "30d" });
+}
+
+// ---------------------------------------------------------------------------
+// PASSWORD AUTH
+// ---------------------------------------------------------------------------
+app.post("/api/register", safe(async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password || username.trim().length < 3 || password.length < 4) {
+    return res.status(400).json({ error: "Username (3+ chars) and password (4+ chars) required." });
+  }
+  const clean = username.trim().toLowerCase();
+  if (await db.getUserByUsername(clean)) {
+    return res.status(409).json({ error: "That username is already taken." });
+  }
+  const hash = bcrypt.hashSync(password, 10);
+  const user = await db.createUser(clean, hash);
+  res.json({ token: issueToken(user), username: clean });
+}));
+
+app.post("/api/login", safe(async (req, res) => {
   const { username, password } = req.body || {};
   const clean = (username || "").trim().toLowerCase();
-
-  const state = getLoginState(clean);
-  if (state.lockedUntil && Date.now() < state.lockedUntil) {
-    const secondsLeft = Math.ceil((state.lockedUntil - Date.now()) / 1000);
-    const minutesLeft = Math.ceil(secondsLeft / 60);
-    return res.status(429).json({ error: `Too many failed attempts. Try again in ${minutesLeft} minute(s).` });
-  }
-
   const user = await db.getUserByUsername(clean);
   if (!user || !bcrypt.compareSync(password || "", user.password_hash)) {
-    const justLocked = recordFailedLogin(clean);
-    if (justLocked) {
-      return res.status(429).json({ error: `Too many failed attempts. Try again in ${Math.ceil(LOCKOUT_MS / 60000)} minute(s).` });
-    }
     return res.status(401).json({ error: "Invalid username or password." });
   }
-
-  if (user.banned_until && new Date(user.banned_until) > new Date()) {
-    return res.status(403).json({ error: "This account has been suspended." });
-  }
-
-  clearFailedLogins(clean);
-  await db.updateLastLogin(user.id);
-  const token = jwt.sign({ uid: user.id, username: user.username }, JWT_SECRET, { expiresIn: "30d" });
-  res.json({ token, username: user.username, isAdmin: !!user.is_admin });
+  await db.ensureBootstrapAdmin(user.username);
+  const fresh = await db.getUserByUsername(clean); // re-read in case bootstrap just changed is_admin
+  res.json({ token: issueToken(fresh), username: fresh.username, is_admin: !!fresh.is_admin });
 }));
 
 app.get("/api/me", authMiddleware, safe(async (req, res) => {
-  res.json({ username: req.username, isAdmin: req.isAdmin });
+  const user = await db.getUserById(req.userId);
+  res.json({ id: req.userId, username: req.username, is_admin: !!(user && user.is_admin) });
 }));
 
-app.post("/api/register", authLimiter, safe(async (req, res) => {
-  const { username, password, securityQuestion, securityAnswer } = req.body || {};
-  const clean = (username || "").trim().toLowerCase();
+// ---------------------------------------------------------------------------
+// WEBAUTHN — BIOMETRIC LOGIN (Face ID / fingerprint / Windows Hello)
+// The server only ever stores a public key + counter, never any biometric
+// data. Registration requires being already logged in (password or existing
+// biometric); login works standalone once a device is registered.
+// ---------------------------------------------------------------------------
 
-  if (!/^[a-z0-9_]{3,20}$/.test(clean)) {
-    return res.status(400).json({ error: "Username must be 3-20 characters: letters, numbers, underscores only." });
-  }
-  if (!password || password.length < 6) {
-    return res.status(400).json({ error: "Password must be at least 6 characters." });
-  }
-  if (!securityQuestion || !securityQuestion.trim()) {
-    return res.status(400).json({ error: "Security question is required." });
-  }
-  if (!securityAnswer || !securityAnswer.trim()) {
-    return res.status(400).json({ error: "Security answer is required." });
-  }
-
-  const existing = await db.getUserByUsername(clean);
-  if (existing) {
-    return res.status(409).json({ error: "That username is already taken." });
-  }
-
-  const password_hash = bcrypt.hashSync(password, 10);
-  const security_answer_hash = bcrypt.hashSync(securityAnswer.trim().toLowerCase(), 10);
-  const user = await db.createUser(clean, password_hash, securityQuestion.trim(), security_answer_hash);
-
-  const token = jwt.sign({ uid: user.id, username: user.username }, JWT_SECRET, { expiresIn: "30d" });
-  res.json({ token, username: user.username });
+// STEP 1 of registering a new biometric device (must be logged in already)
+app.post("/api/webauthn/register-options", authMiddleware, safe(async (req, res) => {
+  const existing = await db.getAuthenticatorsByUser(req.userId);
+  const options = await generateRegistrationOptions({
+    rpName: RP_NAME,
+    rpID: RP_ID,
+    userName: req.username,
+    userID: Buffer.from(String(req.userId)),
+    attestationType: "none",
+    excludeCredentials: existing.map(a => ({ id: a.credential_id, transports: a.transports })),
+    authenticatorSelection: {
+      residentKey: "preferred",
+      userVerification: "required" // forces Face ID / fingerprint / PIN, not just "device present"
+    }
+  });
+  await db.saveChallenge(req.userId, options.challenge);
+  res.json(options);
 }));
 
-app.get("/api/forgot-password/:username", authLimiter, safe(async (req, res) => {
-  const clean = (req.params.username || "").trim().toLowerCase();
-  const user = await db.getUserByUsername(clean);
-  if (!user) return res.status(404).json({ error: "No account with that username." });
-  res.json({ question: user.security_question });
-}));
+// STEP 2 of registering — browser sends back the signed credential
+app.post("/api/webauthn/register-verify", authMiddleware, safe(async (req, res) => {
+  const expectedChallenge = await db.getChallenge(req.userId);
+  if (!expectedChallenge) return res.status(400).json({ error: "Registration expired. Try again." });
 
-app.post("/api/forgot-password/reset", authLimiter, safe(async (req, res) => {
-  const { username, answer, newPassword } = req.body || {};
-  const clean = (username || "").trim().toLowerCase();
-  const user = await db.getUserByUsername(clean);
-  if (!user) return res.status(404).json({ error: "No account with that username." });
-
-  const cleanAnswer = (answer || "").trim().toLowerCase();
-  if (!bcrypt.compareSync(cleanAnswer, user.security_answer_hash)) {
-    return res.status(401).json({ error: "That answer doesn't match." });
+  let verification;
+  try {
+    verification = await verifyRegistrationResponse({
+      response: req.body,
+      expectedChallenge,
+      expectedOrigin: ORIGIN,
+      expectedRPID: RP_ID
+    });
+  } catch (e) {
+    return res.status(400).json({ error: "Could not verify device: " + e.message });
   }
-  if (!newPassword || newPassword.length < 6) {
-    return res.status(400).json({ error: "New password must be at least 6 characters." });
-  }
+  if (!verification.verified) return res.status(400).json({ error: "Verification failed." });
 
-  const password_hash = bcrypt.hashSync(newPassword, 10);
-  await db.updatePassword(user.id, password_hash);
-  clearFailedLogins(clean);
+  const { credential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo;
+  await db.addAuthenticator({
+    user_id: req.userId,
+    credential_id: credential.id,
+    public_key: Buffer.from(credential.publicKey).toString("base64url"),
+    counter: credential.counter,
+    device_type: credentialDeviceType,
+    backed_up: credentialBackedUp,
+    transports: credential.transports || [],
+    nickname: req.body.nickname || "This device"
+  });
+  await db.clearChallenge(req.userId);
   res.json({ ok: true });
 }));
 
+// STEP 1 of logging in with biometrics — no username needed if the device
+// supports discoverable credentials (Face ID / Touch ID do)
+app.post("/api/webauthn/login-options", safe(async (req, res) => {
+  const options = await generateAuthenticationOptions({
+    rpID: RP_ID,
+    userVerification: "required"
+  });
+  await db.saveChallenge(null, options.challenge);
+  res.json(options);
+}));
+
+// STEP 2 of logging in — verify the signed challenge, issue a normal JWT
+app.post("/api/webauthn/login-verify", safe(async (req, res) => {
+  const expectedChallenge = await db.getChallenge(null);
+  if (!expectedChallenge) return res.status(400).json({ error: "Login expired. Try again." });
+
+  const authenticator = await db.getAuthenticatorByCredentialId(req.body.id);
+  if (!authenticator) return res.status(400).json({ error: "This device isn't registered to any account." });
+
+  let verification;
+  try {
+    verification = await verifyAuthenticationResponse({
+      response: req.body,
+      expectedChallenge,
+      expectedOrigin: ORIGIN,
+      expectedRPID: RP_ID,
+      credential: {
+        id: authenticator.credential_id,
+        publicKey: Buffer.from(authenticator.public_key, "base64url"),
+        counter: authenticator.counter,
+        transports: authenticator.transports
+      }
+    });
+  } catch (e) {
+    return res.status(400).json({ error: "Could not verify: " + e.message });
+  }
+  if (!verification.verified) return res.status(400).json({ error: "Verification failed." });
+
+  await db.updateAuthenticatorCounter(authenticator.credential_id, verification.authenticationInfo.newCounter);
+  await db.clearChallenge(null);
+
+  const user = await db.getUserById(authenticator.user_id);
+  if (!user) return res.status(404).json({ error: "Account not found." });
+
+  res.json({ token: issueToken(user), username: user.username, is_admin: !!user.is_admin });
+}));
+
+app.get("/api/webauthn/devices", authMiddleware, safe(async (req, res) => {
+  const rows = await db.getAuthenticatorsByUser(req.userId);
+  res.json({ devices: rows.map(r => ({ credential_id: r.credential_id, nickname: r.nickname, created_at: r.created_at })) });
+}));
+
+app.delete("/api/webauthn/devices/:credentialId", authMiddleware, safe(async (req, res) => {
+  await db.deleteAuthenticator(req.userId, req.params.credentialId);
+  res.json({ ok: true });
+}));
+
+// ---------------------------------------------------------------------------
+// CONTACTS
+// ---------------------------------------------------------------------------
 app.get("/api/contacts", authMiddleware, safe(async (req, res) => {
   res.json({ contacts: await db.getContacts(req.userId) });
 }));
@@ -232,6 +236,9 @@ app.post("/api/contacts", authMiddleware, safe(async (req, res) => {
   res.json({ contact: { id: target.id, username: target.username } });
 }));
 
+// ---------------------------------------------------------------------------
+// MESSAGES (1:1 chat)
+// ---------------------------------------------------------------------------
 function roomFor(idA, idB) {
   const [a, b] = [idA, idB].sort((x, y) => x - y);
   return `chat:${a}:${b}`;
@@ -252,7 +259,7 @@ app.get("/api/messages/:username", authMiddleware, safe(async (req, res) => {
   res.json({ messages: out });
 }));
 
-app.post("/api/messages", authMiddleware, writeLimiter, safe(async (req, res) => {
+app.post("/api/messages", authMiddleware, safe(async (req, res) => {
   const { to, numbers, kind, image } = req.body || {};
   const other = await db.getUserByUsername((to || "").trim().toLowerCase());
   if (!other) return res.status(404).json({ error: "Recipient not found." });
@@ -276,11 +283,14 @@ app.post("/api/messages", authMiddleware, writeLimiter, safe(async (req, res) =>
   res.json({ message: payload });
 }));
 
+// ---------------------------------------------------------------------------
+// STATUSES
+// ---------------------------------------------------------------------------
 app.get("/api/statuses", authMiddleware, safe(async (req, res) => {
   res.json({ statuses: await db.getStatuses(100) });
 }));
 
-app.post("/api/statuses", authMiddleware, writeLimiter, safe(async (req, res) => {
+app.post("/api/statuses", authMiddleware, safe(async (req, res) => {
   const { text, image } = req.body || {};
   if (!text || !text.trim()) return res.status(400).json({ error: "Status text required." });
   const saved = await db.insertStatus({ user_id: req.userId, text: text.trim(), image });
@@ -288,6 +298,9 @@ app.post("/api/statuses", authMiddleware, writeLimiter, safe(async (req, res) =>
   res.json({ ok: true });
 }));
 
+// ---------------------------------------------------------------------------
+// MEETINGS
+// ---------------------------------------------------------------------------
 app.post("/api/meetings", authMiddleware, safe(async (req, res) => {
   const { pin } = req.body || {};
   const clean = (pin || "").trim();
@@ -297,22 +310,64 @@ app.post("/api/meetings", authMiddleware, safe(async (req, res) => {
   res.json({ pin: clean });
 }));
 
-app.post("/api/meetings/:pin/join", authMiddleware, authLimiter, safe(async (req, res) => {
+app.post("/api/meetings/:pin/join", authMiddleware, safe(async (req, res) => {
   const meeting = await db.getMeeting(req.params.pin);
   if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  const me = await db.getUserById(req.userId);
+  const allowed = await db.canAccessMeeting(meeting, req.username, !!(me && me.is_admin));
+  if (!allowed) {
+    return res.status(403).json({
+      error: "This meeting has been closed. Request access to get back in.",
+      closed: true,
+    });
+  }
   res.json({ pin: meeting.pin });
+}));
+
+// Closes a meeting so nobody but an admin can get back in without a
+// request being approved. Any authenticated host of THIS meeting can
+// close it themselves, or an admin can force-close any meeting.
+app.post("/api/meetings/:pin/close", authMiddleware, safe(async (req, res) => {
+  const meeting = await db.getMeeting(req.params.pin);
+  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  const me = await db.getUserById(req.userId);
+  const isHost = meeting.host_id === req.userId;
+  const isAdmin = !!(me && me.is_admin);
+  if (!isHost && !isAdmin) return res.status(403).json({ error: "Only the host or an admin can close this meeting." });
+  if (meeting.status === "CLOSED") return res.status(400).json({ error: "This meeting is already closed." });
+
+  await db.closeMeeting(req.params.pin, req.userId);
+  io.to(`meeting:${req.params.pin}`).emit("meeting:closed", { pin: req.params.pin });
+  res.json({ ok: true });
+}));
+
+// Submits a request to get back into a closed meeting. Admin reviews these
+// in the admin portal — never auto-approved.
+app.post("/api/meetings/:pin/request-access", authMiddleware, safe(async (req, res) => {
+  const meeting = await db.getMeeting(req.params.pin);
+  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  if (meeting.status !== "CLOSED") return res.status(400).json({ error: "This meeting isn't closed — you can join it directly." });
+
+  const request = await db.createAccessRequest(req.params.pin, req.userId, req.username);
+  res.json({ request });
 }));
 
 app.get("/api/meetings/:pin/messages", authMiddleware, safe(async (req, res) => {
   const meeting = await db.getMeeting(req.params.pin);
   if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  const me = await db.getUserById(req.userId);
+  const allowed = await db.canAccessMeeting(meeting, req.username, !!(me && me.is_admin));
+  if (!allowed) return res.status(403).json({ error: "This meeting has been closed.", closed: true });
   res.json({ messages: await db.getMeetingMessages(req.params.pin) });
 }));
 
-app.post("/api/meetings/:pin/messages", authMiddleware, writeLimiter, safe(async (req, res) => {
+app.post("/api/meetings/:pin/messages", authMiddleware, safe(async (req, res) => {
   const { numbers } = req.body || {};
   const meeting = await db.getMeeting(req.params.pin);
   if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  const me = await db.getUserById(req.userId);
+  const allowed = await db.canAccessMeeting(meeting, req.username, !!(me && me.is_admin));
+  if (!allowed) return res.status(403).json({ error: "This meeting has been closed.", closed: true });
   if (!Array.isArray(numbers) || numbers.length === 0) return res.status(400).json({ error: "Encoded numbers required." });
 
   const saved = await db.insertMeetingMessage({ pin: req.params.pin, sender_username: req.username, numbers });
@@ -320,62 +375,28 @@ app.post("/api/meetings/:pin/messages", authMiddleware, writeLimiter, safe(async
   res.json({ message: saved });
 }));
 
-// ---------------------------------------------------------------------
-// ADMIN
-// ---------------------------------------------------------------------
-
-app.get("/api/admin/users", authMiddleware, adminMiddleware, safe(async (req, res) => {
-  res.json({ users: await db.getAllUsersForAdmin() });
+// ---------------------------------------------------------------------------
+// ADMIN — meeting access request queue
+// ---------------------------------------------------------------------------
+app.get("/api/admin/meeting-requests", authMiddleware, requireAdmin, safe(async (req, res) => {
+  res.json({ requests: await db.getPendingAccessRequests() });
 }));
 
-app.post("/api/admin/users/:id/ban", authMiddleware, adminMiddleware, safe(async (req, res) => {
-  const targetId = Number(req.params.id);
-  if (targetId === req.userId) return res.status(400).json({ error: "You can't ban yourself." });
-
-  const target = await db.getUserById(targetId);
-  if (!target) return res.status(404).json({ error: "User not found." });
-
-  const hours = Number(req.body?.hours);
-  if (!hours || hours <= 0) return res.status(400).json({ error: "Provide a positive number of hours." });
-
-  const bannedUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
-  await db.banUserUntil(targetId, bannedUntil);
-  res.json({ ok: true, banned_until: bannedUntil });
+app.post("/api/admin/meeting-requests/:id/approve", authMiddleware, requireAdmin, safe(async (req, res) => {
+  const request = await db.resolveAccessRequest(Number(req.params.id), true, req.userId);
+  if (!request) return res.status(404).json({ error: "Request not found." });
+  res.json({ request });
 }));
 
-app.post("/api/admin/users/:id/unban", authMiddleware, adminMiddleware, safe(async (req, res) => {
-  const targetId = Number(req.params.id);
-  const target = await db.getUserById(targetId);
-  if (!target) return res.status(404).json({ error: "User not found." });
-  await db.unbanUser(targetId);
-  res.json({ ok: true });
+app.post("/api/admin/meeting-requests/:id/deny", authMiddleware, requireAdmin, safe(async (req, res) => {
+  const request = await db.resolveAccessRequest(Number(req.params.id), false, req.userId);
+  if (!request) return res.status(404).json({ error: "Request not found." });
+  res.json({ request });
 }));
 
-app.post("/api/admin/users/:id/password", authMiddleware, adminMiddleware, safe(async (req, res) => {
-  const targetId = Number(req.params.id);
-  const target = await db.getUserById(targetId);
-  if (!target) return res.status(404).json({ error: "User not found." });
-
-  const { newPassword } = req.body || {};
-  if (!newPassword || newPassword.length < 6) {
-    return res.status(400).json({ error: "New password must be at least 6 characters." });
-  }
-  const password_hash = bcrypt.hashSync(newPassword, 10);
-  await db.adminSetPassword(targetId, password_hash);
-  res.json({ ok: true });
-}));
-
-app.delete("/api/admin/users/:id", authMiddleware, adminMiddleware, safe(async (req, res) => {
-  const targetId = Number(req.params.id);
-  if (targetId === req.userId) return res.status(400).json({ error: "You can't delete your own account." });
-
-  const target = await db.getUserById(targetId);
-  if (!target) return res.status(404).json({ error: "User not found." });
-
-  await db.deleteUserCascade(targetId);
-  res.json({ ok: true });
-}));
-
+// ---------------------------------------------------------------------------
+// SOCKET.IO
+// ---------------------------------------------------------------------------
 io.use((socket, next) => {
   try {
     const token = socket.handshake.auth?.token;
@@ -388,13 +409,15 @@ io.use((socket, next) => {
   }
 });
 
-io.on("connection", async (socket) => {
-  try {
-    const contacts = await db.getContacts(socket.userId);
-    contacts.forEach(c => socket.join(roomFor(socket.userId, c.id)));
-  } catch (e) {
-    console.error("Error joining contact rooms:", e);
-  }
+io.on("connection", (socket) => {
+  (async () => {
+    try {
+      const contacts = await db.getContacts(socket.userId);
+      contacts.forEach(c => socket.join(roomFor(socket.userId, c.id)));
+    } catch (e) {
+      console.error("Error joining contact rooms:", e);
+    }
+  })();
 
   socket.on("meeting:join", (pin) => {
     if (pin) socket.join(`meeting:${pin}`);
@@ -409,14 +432,6 @@ app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-db.connect()
-  .then(() => {
-    server.listen(PORT, () => {
-      console.log(`SWIPE server running on http://localhost:${PORT}`);
-    });
-  })
-  .catch(err => {
-    console.error("Failed to connect to MongoDB. Server not started.");
-    console.error(err);
-    process.exit(1);
-  });
+server.listen(PORT, () => {
+  console.log(`SWIPE server running on http://localhost:${PORT}`);
+});

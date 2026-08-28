@@ -8,9 +8,18 @@ it online so your friends can use it.
 
 - **Real accounts**: sign up with a username + password. Passwords are hashed
   (bcrypt), sessions use JWT tokens.
+- **Real, permanent database**: MongoDB Atlas (free tier) — data survives
+  server restarts and redeploys. (The old JSON-file version lost everyone's
+  accounts every time Render restarted, because Render's free disk isn't
+  persistent. That's fixed now.)
+- **Face ID / fingerprint / Windows Hello login** via WebAuthn — after
+  logging in once with a password, tap "Enable Face ID / Fingerprint" and
+  future logins can skip the password entirely. Your device checks your
+  face/fingerprint locally; the server only ever stores a public key, never
+  any biometric data.
 - **Real contacts**: add a friend by their exact username (not a made-up name).
   Adding someone is mutual — they see you in their contact list too.
-- **Real message delivery**: messages are stored in a database and pushed
+- **Real message delivery**: messages are stored in the database and pushed
   instantly to the other person over a live connection (Socket.io), whether
   they're online right now or check back later.
 - **The cipher is still yours**: the server only ever stores/relays the encoded
@@ -25,13 +34,28 @@ it online so your friends can use it.
 
 ```
 swipe-app/
-  server.js        <- backend (Express + Socket.io + SQLite)
+  server.js        <- backend (Express + Socket.io + MongoDB + WebAuthn)
+  db.js             <- all database access (MongoDB via Mongoose)
   package.json
   public/
     index.html      <- the whole frontend (login screen + chat UI)
-  data/
-    swipe.db         <- created automatically on first run
+  .env.example      <- copy to .env for local dev
 ```
+
+## One-time setup: MongoDB Atlas (free forever)
+
+1. Create a free account at https://www.mongodb.com/cloud/atlas/register
+2. Create a free **M0 cluster** (any region close to you is fine).
+3. **Database Access** → add a database user (e.g. username `Swipeadmin`),
+   generate/set a password, save it somewhere safe.
+4. **Network Access** → add IP address → allow access from anywhere
+   (`0.0.0.0/0`) — fine for a small friends app.
+5. **Database → Connect → Drivers → Node.js** → copy the connection string.
+   It looks like:
+   `mongodb+srv://Swipeadmin:<password>@swipecluster.xxxxx.mongodb.net/?retryWrites=true&w=majority`
+   Replace `<password>` with your real password, and add `/swipe` before the
+   `?` so it points at a database named `swipe`.
+6. That full string is your `MONGODB_URI`.
 
 ## Running it locally (to test before you deploy)
 
@@ -40,6 +64,8 @@ You need [Node.js](https://nodejs.org) 18+ installed.
 ```bash
 cd swipe-app
 npm install
+cp .env.example .env
+# edit .env and paste in your MONGODB_URI from the Atlas step above
 npm start
 ```
 
@@ -47,12 +73,9 @@ Then open **http://localhost:3000** — sign up, open a second browser (or an
 incognito window) and sign up as a second user, add each other as contacts,
 and chat.
 
-## Putting it online for real (free options)
+## Putting it online for real
 
-You need actual hosting since this has a backend + database. Two easy, free
-ways to do this:
-
-### Option A: Render.com (recommended, simplest)
+### Render.com (recommended, simplest, free)
 
 1. Create a free account at https://render.com
 2. Push this folder to a GitHub repo (see below if you haven't used Git).
@@ -60,21 +83,16 @@ ways to do this:
 4. Settings:
    - **Build command**: `npm install`
    - **Start command**: `npm start`
-5. Add an environment variable: `JWT_SECRET` = any long random string (this
-   signs login sessions — keep it secret).
-6. Deploy. Render gives you a public URL like `https://swipe-xxxx.onrender.com`
-   — send that link to your friends.
+5. Add environment variables (Dashboard → your service → Environment):
+   - `JWT_SECRET` = any long random string
+   - `MONGODB_URI` = your full Atlas connection string from above
+   - `RP_ID` = your Render domain with no `https://`, e.g. `swipe-app-wzqp.onrender.com`
+   - `ORIGIN` = your full Render URL with `https://`, e.g. `https://swipe-app-wzqp.onrender.com`
+6. Deploy. Render gives you a public URL — send that link to your friends.
 
-⚠️ One catch on Render's free tier: the SQLite database file lives on disk,
-and free-tier disks aren't guaranteed to persist forever across redeploys.
-For a class project / friends-only demo this is fine. If you want your data
-to survive long-term, the fix later is switching to Render's free PostgreSQL
-add-on instead of SQLite — ask me when you're ready and I'll wire that up.
-
-### Option B: Railway.app
-
-Same idea as Render — connect your GitHub repo, it auto-detects Node.js,
-set the `JWT_SECRET` environment variable, deploy, get a public URL.
+⚠️ `RP_ID` and `ORIGIN` matter specifically for Face ID/fingerprint login to
+work — WebAuthn checks that the domain matches exactly. If you ever move to
+a custom domain, update both.
 
 ### If you haven't used GitHub yet
 
