@@ -77,10 +77,19 @@ const MeetingSchema = new mongoose.Schema({
   closed_at: { type: Date, default: null },
   closed_by: { type: Number, default: null },
   // Usernames granted access back into a CLOSED meeting via an approved
-  // request. The host does NOT automatically keep access after closing —
-  // once closed, only an admin has standing access; everyone else
-  // (including the original host) must request it again, same as anyone.
+  // request (or a bulk "let everyone back in" action by an admin). The host
+  // does NOT automatically keep access after closing — once closed, only an
+  // admin has standing access; everyone else, including the original host,
+  // must request it again like anyone else.
   approved_usernames: { type: [String], default: [] },
+  // Everyone who has ever successfully joined this meeting (host included).
+  // Used both for the admin's "let everyone back in" bulk action and for
+  // enforcing the host's optional headcount cap.
+  participants: { type: [String], default: [] },
+  // Optional cap the host sets on how many distinct people may be in the
+  // meeting at once. null = unlimited. Once reached, new joins are blocked
+  // until the host or an admin resets it (clears the participants list).
+  max_participants: { type: Number, default: null },
   created_at: { type: Date, default: Date.now }
 });
 const Meeting = mongoose.model("Meeting", MeetingSchema);
@@ -226,8 +235,13 @@ async function insertStatus({ user_id, text, image }) {
 async function getMeeting(pin) {
   return Meeting.findOne({ pin }).lean();
 }
-async function createMeeting(pin, host_id) {
-  const meeting = await Meeting.create({ pin, host_id });
+async function createMeeting(pin, host_id, host_username, max_participants) {
+  const meeting = await Meeting.create({
+    pin,
+    host_id,
+    participants: host_username ? [host_username] : [],
+    max_participants: max_participants != null ? max_participants : null,
+  });
   return meeting.toObject();
 }
 async function closeMeeting(pin, closed_by) {
@@ -247,6 +261,42 @@ async function canAccessMeeting(meeting, username, isAdmin) {
   if (meeting.status === "OPEN") return true;
   return (meeting.approved_usernames || []).includes(username);
 }
+
+// Records that this user is "in" the meeting, for headcount purposes.
+// Returns { ok: true } or { ok: false, reason: "full" } if the host's cap
+// has been reached and this is a brand-new participant (people already
+// counted can always continue, since they already hold a seat).
+async function joinAsParticipant(pin, username) {
+  const meeting = await Meeting.findOne({ pin });
+  if (!meeting) return { ok: false, reason: "not_found" };
+  if (meeting.participants.includes(username)) return { ok: true };
+  if (meeting.max_participants != null && meeting.participants.length >= meeting.max_participants) {
+    return { ok: false, reason: "full" };
+  }
+  meeting.participants.push(username);
+  await meeting.save();
+  return { ok: true };
+}
+async function setMeetingCapacity(pin, max_participants) {
+  const meeting = await Meeting.findOneAndUpdate({ pin }, { max_participants }, { new: true });
+  return meeting ? meeting.toObject() : null;
+}
+// Clears the headcount so joins are allowed again up to the same cap.
+// Does not change who's approved/closed — just the seat count.
+async function resetMeetingCapacity(pin) {
+  const meeting = await Meeting.findOneAndUpdate({ pin }, { participants: [] }, { new: true });
+  return meeting ? meeting.toObject() : null;
+}
+// Admin bulk action: let every past participant back into a closed meeting
+// at once, instead of approving each one's request individually.
+async function reopenMeetingForAllParticipants(pin) {
+  const meeting = await Meeting.findOne({ pin });
+  if (!meeting) return null;
+  meeting.approved_usernames = Array.from(new Set([...(meeting.approved_usernames || []), ...meeting.participants]));
+  await meeting.save();
+  return meeting.toObject();
+}
+
 async function getMeetingMessages(pin) {
   return MeetingMessage.find({ pin }).sort({ id: 1 }).lean();
 }
@@ -322,6 +372,7 @@ module.exports = {
   getMessagesBetween, insertMessage,
   getStatuses, insertStatus,
   getMeeting, createMeeting, closeMeeting, canAccessMeeting, getMeetingMessages, insertMeetingMessage,
+  joinAsParticipant, setMeetingCapacity, resetMeetingCapacity, reopenMeetingForAllParticipants,
   createAccessRequest, getPendingAccessRequests, resolveAccessRequest,
   saveChallenge, getChallenge, clearChallenge,
   addAuthenticator, getAuthenticatorsByUser, getAuthenticatorByCredentialId,

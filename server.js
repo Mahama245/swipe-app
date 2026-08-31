@@ -302,25 +302,42 @@ app.post("/api/statuses", authMiddleware, safe(async (req, res) => {
 // MEETINGS
 // ---------------------------------------------------------------------------
 app.post("/api/meetings", authMiddleware, safe(async (req, res) => {
-  const { pin } = req.body || {};
+  const { pin, max_participants } = req.body || {};
   const clean = (pin || "").trim();
   if (clean.length < 4) return res.status(400).json({ error: "PIN must be at least 4 characters." });
   if (await db.getMeeting(clean)) return res.status(409).json({ error: "That PIN is already in use. Pick another." });
-  await db.createMeeting(clean, req.userId);
-  res.json({ pin: clean });
+  const cap = max_participants != null && max_participants !== "" ? Number(max_participants) : null;
+  if (cap != null && (!Number.isInteger(cap) || cap < 1)) {
+    return res.status(400).json({ error: "max_participants must be a whole number of 1 or more." });
+  }
+  await db.createMeeting(clean, req.userId, req.username, cap);
+  res.json({ pin: clean, max_participants: cap });
 }));
 
 app.post("/api/meetings/:pin/join", authMiddleware, safe(async (req, res) => {
   const meeting = await db.getMeeting(req.params.pin);
   if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
   const me = await db.getUserById(req.userId);
-  const allowed = await db.canAccessMeeting(meeting, req.username, !!(me && me.is_admin));
+  const isAdmin = !!(me && me.is_admin);
+  const allowed = await db.canAccessMeeting(meeting, req.username, isAdmin);
   if (!allowed) {
     return res.status(403).json({
       error: "This meeting has been closed. Request access to get back in.",
       closed: true,
     });
   }
+
+  // Admins joining to review don't count against the host's headcount cap.
+  if (!isAdmin) {
+    const seat = await db.joinAsParticipant(req.params.pin, req.username);
+    if (!seat.ok && seat.reason === "full") {
+      return res.status(403).json({
+        error: "This meeting is full. Ask the host to raise the limit or reset it.",
+        full: true,
+      });
+    }
+  }
+
   res.json({ pin: meeting.pin });
 }));
 
@@ -338,6 +355,47 @@ app.post("/api/meetings/:pin/close", authMiddleware, safe(async (req, res) => {
 
   await db.closeMeeting(req.params.pin, req.userId);
   io.to(`meeting:${req.params.pin}`).emit("meeting:closed", { pin: req.params.pin });
+  res.json({ ok: true });
+}));
+
+// Host or admin sets/changes the headcount cap. Pass max_participants: null
+// to remove the limit entirely.
+app.patch("/api/meetings/:pin/capacity", authMiddleware, safe(async (req, res) => {
+  const meeting = await db.getMeeting(req.params.pin);
+  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  const me = await db.getUserById(req.userId);
+  const isHost = meeting.host_id === req.userId;
+  const isAdmin = !!(me && me.is_admin);
+  if (!isHost && !isAdmin) return res.status(403).json({ error: "Only the host or an admin can change this meeting's capacity." });
+
+  const { max_participants } = req.body || {};
+  const cap = max_participants === null || max_participants === undefined ? null : Number(max_participants);
+  if (cap != null && (!Number.isInteger(cap) || cap < 1)) {
+    return res.status(400).json({ error: "max_participants must be a whole number of 1 or more, or null to remove the limit." });
+  }
+  const updated = await db.setMeetingCapacity(req.params.pin, cap);
+  res.json({ pin: updated.pin, max_participants: updated.max_participants, participants: updated.participants.length });
+}));
+
+// Host/admin need current headcount + limit info; kept lightweight and
+// separate from /messages since it's polled by the capacity control UI.
+app.get("/api/meetings/:pin/capacity", authMiddleware, safe(async (req, res) => {
+  const meeting = await db.getMeeting(req.params.pin);
+  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  res.json({ max_participants: meeting.max_participants, participant_count: meeting.participants.length });
+}));
+
+// Clears the current headcount (not who's approved/closed) so new people
+// can join again up to the same cap.
+app.post("/api/meetings/:pin/reset-capacity", authMiddleware, safe(async (req, res) => {
+  const meeting = await db.getMeeting(req.params.pin);
+  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  const me = await db.getUserById(req.userId);
+  const isHost = meeting.host_id === req.userId;
+  const isAdmin = !!(me && me.is_admin);
+  if (!isHost && !isAdmin) return res.status(403).json({ error: "Only the host or an admin can reset this meeting's capacity." });
+
+  await db.resetMeetingCapacity(req.params.pin);
   res.json({ ok: true });
 }));
 
@@ -392,6 +450,15 @@ app.post("/api/admin/meeting-requests/:id/deny", authMiddleware, requireAdmin, s
   const request = await db.resolveAccessRequest(Number(req.params.id), false, req.userId);
   if (!request) return res.status(404).json({ error: "Request not found." });
   res.json({ request });
+}));
+
+// Admin bulk action: let everyone who was ever in this meeting back in at
+// once, instead of approving each person's request one at a time.
+app.post("/api/admin/meetings/:pin/reopen-for-all", authMiddleware, requireAdmin, safe(async (req, res) => {
+  const meeting = await db.getMeeting(req.params.pin);
+  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  const updated = await db.reopenMeetingForAllParticipants(req.params.pin);
+  res.json({ ok: true, approved_count: updated.approved_usernames.length });
 }));
 
 // ---------------------------------------------------------------------------
