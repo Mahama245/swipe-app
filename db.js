@@ -39,6 +39,12 @@ const UserSchema = new mongoose.Schema({
   username: { type: String, unique: true, index: true },
   password_hash: String,
   is_admin: { type: Boolean, default: false },
+  // "active" can use the app normally. "suspended" is a temporary,
+  // reversible block (e.g. while a report is reviewed). "banned" is the
+  // permanent version. Both suspended and banned users are refused at
+  // login AND on every authenticated request thereafter (see server.js),
+  // so kicking someone takes effect immediately even mid-session.
+  status: { type: String, enum: ["active", "suspended", "banned"], default: "active" },
   created_at: { type: Date, default: Date.now }
 });
 const User = mongoose.model("User", UserSchema);
@@ -115,6 +121,23 @@ const MeetingMessageSchema = new mongoose.Schema({
 });
 const MeetingMessage = mongoose.model("MeetingMessage", MeetingMessageSchema);
 
+// Records every admin action (suspend/ban/delete/reset-password, meeting
+// request decisions, bulk reopens) with who did it and when, so there's a
+// paper trail for anything an admin does — separate from the mutation
+// itself, so it stays intact even if the target user is later deleted.
+const AdminAuditLogSchema = new mongoose.Schema({
+  id: { type: Number, unique: true },
+  actor_id: Number,
+  actor_username: String,
+  action: String, // e.g. "suspend_user", "ban_user", "delete_user", "reset_password", "approve_request"
+  target_type: String, // "user" | "meeting_request" | "meeting"
+  target_id: mongoose.Schema.Types.Mixed, // numeric id, or a PIN string for meetings
+  target_username: { type: String, default: null },
+  details: { type: String, default: null },
+  created_at: { type: Date, default: Date.now }
+});
+const AdminAuditLog = mongoose.model("AdminAuditLog", AdminAuditLogSchema);
+
 // WebAuthn credentials (Face ID / fingerprint / Windows Hello).
 // The server NEVER sees biometric data — only a public key + counter.
 const AuthenticatorSchema = new mongoose.Schema({
@@ -172,6 +195,59 @@ async function ensureBootstrapAdmin(username) {
   const bootstrapUsername = (process.env.BOOTSTRAP_ADMIN_USERNAME || "mahama245").toLowerCase();
   if (username !== bootstrapUsername) return;
   await User.updateOne({ username }, { is_admin: true });
+}
+
+function isBootstrapAdminUsername(username) {
+  const bootstrapUsername = (process.env.BOOTSTRAP_ADMIN_USERNAME || "mahama245").toLowerCase();
+  return username === bootstrapUsername;
+}
+
+// ---------------------------------------------------------------------------
+// ADMIN — user management
+// ---------------------------------------------------------------------------
+async function listUsers() {
+  const users = await User.find().sort({ id: 1 }).lean();
+  return users.map(u => ({
+    id: u.id,
+    username: u.username,
+    is_admin: !!u.is_admin,
+    status: u.status || "active",
+    created_at: u.created_at
+  }));
+}
+async function setUserStatus(userId, status) {
+  const user = await User.findOneAndUpdate({ id: userId }, { status }, { new: true });
+  return user ? user.toObject() : null;
+}
+async function deleteUserAccount(userId) {
+  const user = await User.findOne({ id: userId }).lean();
+  if (!user) return null;
+  await User.deleteOne({ id: userId });
+  await Contact.deleteMany({ $or: [{ user_id: userId }, { contact_id: userId }] });
+  await Authenticator.deleteMany({ user_id: userId });
+  await Challenge.deleteMany({ user_id: userId });
+  return user;
+}
+async function setUserPasswordHash(userId, password_hash) {
+  const user = await User.findOneAndUpdate({ id: userId }, { password_hash }, { new: true });
+  return user ? user.toObject() : null;
+}
+
+// ---------------------------------------------------------------------------
+// ADMIN AUDIT LOG
+// ---------------------------------------------------------------------------
+async function logAdminAction({ actor_id, actor_username, action, target_type, target_id, target_username, details }) {
+  const id = await nextId("admin_audit_log");
+  const entry = await AdminAuditLog.create({
+    id, actor_id, actor_username, action, target_type,
+    target_id: target_id ?? null,
+    target_username: target_username || null,
+    details: details || null
+  });
+  return entry.toObject();
+}
+async function getAdminAuditLog(limit) {
+  return AdminAuditLog.find().sort({ id: -1 }).limit(limit || 200).lean();
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +443,9 @@ async function deleteAuthenticator(user_id, credential_id) {
 }
 
 module.exports = {
-  getUserByUsername, getUserById, createUser, ensureBootstrapAdmin,
+  getUserByUsername, getUserById, createUser, ensureBootstrapAdmin, isBootstrapAdminUsername,
+  listUsers, setUserStatus, deleteUserAccount, setUserPasswordHash,
+  logAdminAction, getAdminAuditLog,
   addContactPair, getContacts,
   getMessagesBetween, insertMessage,
   getStatuses, insertStatus,

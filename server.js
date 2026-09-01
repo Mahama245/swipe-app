@@ -30,18 +30,30 @@ app.use(express.static(path.join(__dirname, "public")));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
+// Re-checks the account's status from the database on every request, same
+// as requireAdmin does for admin rights below — so a suspension or ban
+// takes effect immediately, kicking the user out mid-session rather than
+// only the next time their token would otherwise expire.
 function authMiddleware(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "Missing token." });
+  let payload;
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.userId = payload.uid;
-    req.username = payload.username;
-    next();
+    payload = jwt.verify(token, JWT_SECRET);
   } catch (e) {
     return res.status(401).json({ error: "Invalid or expired token." });
   }
+  db.getUserById(payload.uid)
+    .then(user => {
+      if (!user) return res.status(401).json({ error: "Account not found." });
+      if (user.status === "banned") return res.status(403).json({ error: "This account has been banned.", banned: true });
+      if (user.status === "suspended") return res.status(403).json({ error: "This account is suspended.", suspended: true });
+      req.userId = payload.uid;
+      req.username = payload.username;
+      next();
+    })
+    .catch(() => res.status(500).json({ error: "Server error checking account status." }));
 }
 
 // Must run AFTER authMiddleware. Re-checks admin status from the database
@@ -91,6 +103,8 @@ app.post("/api/login", safe(async (req, res) => {
   if (!user || !bcrypt.compareSync(password || "", user.password_hash)) {
     return res.status(401).json({ error: "Invalid username or password." });
   }
+  if (user.status === "banned") return res.status(403).json({ error: "This account has been banned.", banned: true });
+  if (user.status === "suspended") return res.status(403).json({ error: "This account is suspended.", suspended: true });
   await db.ensureBootstrapAdmin(user.username);
   const fresh = await db.getUserByUsername(clean); // re-read in case bootstrap just changed is_admin
   res.json({ token: issueToken(fresh), username: fresh.username, is_admin: !!fresh.is_admin });
@@ -203,6 +217,8 @@ app.post("/api/webauthn/login-verify", safe(async (req, res) => {
 
   const user = await db.getUserById(authenticator.user_id);
   if (!user) return res.status(404).json({ error: "Account not found." });
+  if (user.status === "banned") return res.status(403).json({ error: "This account has been banned.", banned: true });
+  if (user.status === "suspended") return res.status(403).json({ error: "This account is suspended.", suspended: true });
 
   res.json({ token: issueToken(user), username: user.username, is_admin: !!user.is_admin });
 }));
@@ -443,12 +459,14 @@ app.get("/api/admin/meeting-requests", authMiddleware, requireAdmin, safe(async 
 app.post("/api/admin/meeting-requests/:id/approve", authMiddleware, requireAdmin, safe(async (req, res) => {
   const request = await db.resolveAccessRequest(Number(req.params.id), true, req.userId);
   if (!request) return res.status(404).json({ error: "Request not found." });
+  await logAdmin(req, "approve_meeting_request", "meeting_request", request.id, request.requester_username, `PIN ${request.pin}`);
   res.json({ request });
 }));
 
 app.post("/api/admin/meeting-requests/:id/deny", authMiddleware, requireAdmin, safe(async (req, res) => {
   const request = await db.resolveAccessRequest(Number(req.params.id), false, req.userId);
   if (!request) return res.status(404).json({ error: "Request not found." });
+  await logAdmin(req, "deny_meeting_request", "meeting_request", request.id, request.requester_username, `PIN ${request.pin}`);
   res.json({ request });
 }));
 
@@ -458,22 +476,115 @@ app.post("/api/admin/meetings/:pin/reopen-for-all", authMiddleware, requireAdmin
   const meeting = await db.getMeeting(req.params.pin);
   if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
   const updated = await db.reopenMeetingForAllParticipants(req.params.pin);
+  await logAdmin(req, "reopen_meeting_for_all", "meeting", req.params.pin, null, `${updated.approved_usernames.length} participant(s) let back in`);
   res.json({ ok: true, approved_count: updated.approved_usernames.length });
+}));
+
+// ---------------------------------------------------------------------------
+// ADMIN — user management (suspend / ban / delete / reset password)
+// ---------------------------------------------------------------------------
+
+// An admin can never take one of these actions on their own account (so they
+// can't accidentally lock themselves out) or on the bootstrap admin account
+// (so there's always at least one admin left to fix things).
+function guardAdminTarget(req, res, targetUser) {
+  if (!targetUser) { res.status(404).json({ error: "User not found." }); return false; }
+  if (targetUser.id === req.userId) { res.status(400).json({ error: "You can't do that to your own account." }); return false; }
+  if (db.isBootstrapAdminUsername(targetUser.username)) { res.status(400).json({ error: "The bootstrap admin account is protected." }); return false; }
+  return true;
+}
+
+// Every admin action logs itself here — who did it, to whom, and when —
+// so nothing an admin does (ban, delete, password reset...) happens off
+// the record. Logging failure never blocks the underlying action.
+function logAdmin(req, action, target_type, target_id, target_username, details) {
+  return db.logAdminAction({
+    actor_id: req.userId,
+    actor_username: req.username,
+    action, target_type, target_id, target_username, details
+  }).catch(err => console.error("Failed to write admin audit log entry:", err));
+}
+
+app.get("/api/admin/users", authMiddleware, requireAdmin, safe(async (req, res) => {
+  res.json({ users: await db.listUsers() });
+}));
+
+app.post("/api/admin/users/:id/suspend", authMiddleware, requireAdmin, safe(async (req, res) => {
+  const target = await db.getUserById(Number(req.params.id));
+  if (!guardAdminTarget(req, res, target)) return;
+  const updated = await db.setUserStatus(target.id, "suspended");
+  await logAdmin(req, "suspend_user", "user", target.id, target.username);
+  res.json({ ok: true, user: { id: updated.id, username: updated.username, status: updated.status } });
+}));
+
+app.post("/api/admin/users/:id/ban", authMiddleware, requireAdmin, safe(async (req, res) => {
+  const target = await db.getUserById(Number(req.params.id));
+  if (!guardAdminTarget(req, res, target)) return;
+  const updated = await db.setUserStatus(target.id, "banned");
+  await logAdmin(req, "ban_user", "user", target.id, target.username);
+  res.json({ ok: true, user: { id: updated.id, username: updated.username, status: updated.status } });
+}));
+
+// Lifts either a suspension or a ban, restoring normal access.
+app.post("/api/admin/users/:id/reactivate", authMiddleware, requireAdmin, safe(async (req, res) => {
+  const target = await db.getUserById(Number(req.params.id));
+  if (!target) return res.status(404).json({ error: "User not found." });
+  const updated = await db.setUserStatus(target.id, "active");
+  await logAdmin(req, "reactivate_user", "user", target.id, target.username);
+  res.json({ ok: true, user: { id: updated.id, username: updated.username, status: updated.status } });
+}));
+
+app.delete("/api/admin/users/:id", authMiddleware, requireAdmin, safe(async (req, res) => {
+  const target = await db.getUserById(Number(req.params.id));
+  if (!guardAdminTarget(req, res, target)) return;
+  await db.deleteUserAccount(target.id);
+  await logAdmin(req, "delete_user", "user", target.id, target.username);
+  res.json({ ok: true });
+}));
+
+app.post("/api/admin/users/:id/reset-password", authMiddleware, requireAdmin, safe(async (req, res) => {
+  const target = await db.getUserById(Number(req.params.id));
+  if (!target) return res.status(404).json({ error: "User not found." });
+  const { new_password } = req.body || {};
+  if (!new_password || new_password.length < 4) {
+    return res.status(400).json({ error: "New password must be at least 4 characters." });
+  }
+  const hash = bcrypt.hashSync(new_password, 10);
+  await db.setUserPasswordHash(target.id, hash);
+  // Never log the password itself — only that a reset happened.
+  await logAdmin(req, "reset_password", "user", target.id, target.username);
+  res.json({ ok: true });
+}));
+
+// ---------------------------------------------------------------------------
+// ADMIN — audit log
+// ---------------------------------------------------------------------------
+app.get("/api/admin/audit-log", authMiddleware, requireAdmin, safe(async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 200, 500);
+  res.json({ entries: await db.getAdminAuditLog(limit) });
 }));
 
 // ---------------------------------------------------------------------------
 // SOCKET.IO
 // ---------------------------------------------------------------------------
 io.use((socket, next) => {
+  let payload;
   try {
     const token = socket.handshake.auth?.token;
-    const payload = jwt.verify(token, JWT_SECRET);
-    socket.userId = payload.uid;
-    socket.username = payload.username;
-    next();
+    payload = jwt.verify(token, JWT_SECRET);
   } catch (e) {
-    next(new Error("unauthorized"));
+    return next(new Error("unauthorized"));
   }
+  db.getUserById(payload.uid)
+    .then(user => {
+      if (!user || user.status === "banned" || user.status === "suspended") {
+        return next(new Error("unauthorized"));
+      }
+      socket.userId = payload.uid;
+      socket.username = payload.username;
+      next();
+    })
+    .catch(() => next(new Error("unauthorized")));
 });
 
 io.on("connection", (socket) => {
