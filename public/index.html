@@ -6,9 +6,9 @@
 <title>SWIPE — encoded messaging</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/12.4.2/math.min.js"></script>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-<script src="https://unpkg.com/@simplewebauthn/browser@11/dist/bundle/index.umd.min.js"></script>
+<script src="https://unpkg.com/@simplewebauthn/browser@13/dist/bundle/index.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
@@ -1549,6 +1549,12 @@ function openQrScanner(){
 
   document.getElementById("qrCancelBtn").addEventListener("click", stop);
 
+  if (typeof jsQR !== "function") {
+    document.getElementById("qrError").textContent = "The QR scanner couldn't load. Check your connection and try again.";
+    document.getElementById("qrError").classList.add("show");
+    return;
+  }
+
   navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
     .then(s => {
       stream = s;
@@ -1563,21 +1569,27 @@ function openQrScanner(){
 
   function tick(){
     if (stopped) return;
-    if (video.readyState === video.HAVE_ENOUGH_DATA) {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const code = jsQR(imageData.data, imageData.width, imageData.height);
-      if (code && code.data && code.data.startsWith(QR_PREFIX)) {
-        const username = code.data.slice(QR_PREFIX.length);
-        stop();
-        addContactByUsername(username).then(result => {
-          if (result.error) toast(result.error, true);
-          else toast(`Added @${result.contact.username}.`);
-        });
-        return;
+    try{
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imageData.data, imageData.width, imageData.height);
+        if (code && code.data && code.data.startsWith(QR_PREFIX)) {
+          const username = code.data.slice(QR_PREFIX.length);
+          stop();
+          addContactByUsername(username).then(result => {
+            if (result.error) toast(result.error, true);
+            else toast(`Added @${result.contact.username}.`);
+          });
+          return;
+        }
       }
+    }catch(e){
+      // A single bad frame should never kill the whole scan loop — log it
+      // and keep scanning instead of silently going dead like before.
+      console.error("QR scan frame error:", e);
     }
     requestAnimationFrame(tick);
   }
