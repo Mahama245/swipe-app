@@ -111,11 +111,6 @@ app.post("/api/login", safe(async (req, res) => {
 }));
 
 app.get("/api/me", authMiddleware, safe(async (req, res) => {
-  // Self-healing: if this is the bootstrap admin username but the flag
-  // somehow isn't set (e.g. the account has only ever used biometric
-  // login before that path also checked this), fix it on the spot rather
-  // than requiring a fresh password login.
-  await db.ensureBootstrapAdmin(req.username);
   const user = await db.getUserById(req.userId);
   const pendingUsernameRequest = await db.getPendingUsernameRequestForUser(req.userId);
   res.json({
@@ -232,13 +227,7 @@ app.post("/api/webauthn/login-verify", safe(async (req, res) => {
   if (user.status === "banned") return res.status(403).json({ error: "This account has been banned.", banned: true });
   if (user.status === "suspended") return res.status(403).json({ error: "This account is suspended.", suspended: true });
 
-  // This was previously only checked on password login, so an account that
-  // only ever signs in via Face ID/fingerprint could stay stuck without
-  // admin rights forever, even as the designated bootstrap admin.
-  await db.ensureBootstrapAdmin(user.username);
-  const fresh = await db.getUserById(user.id);
-
-  res.json({ token: issueToken(fresh), username: fresh.username, is_admin: !!fresh.is_admin, avatar: fresh.avatar || null });
+  res.json({ token: issueToken(user), username: user.username, is_admin: !!user.is_admin, avatar: user.avatar || null });
 }));
 
 app.get("/api/webauthn/devices", authMiddleware, safe(async (req, res) => {
@@ -306,6 +295,13 @@ app.get("/api/contacts", authMiddleware, safe(async (req, res) => {
   res.json({ contacts: await db.getContacts(req.userId) });
 }));
 
+// Everyone you've exchanged a message with — the actual inbox, independent
+// of your curated contacts list. This is what lets a message from someone
+// you haven't added yet still show up and be readable.
+app.get("/api/conversations", authMiddleware, safe(async (req, res) => {
+  res.json({ conversations: await db.getConversations(req.userId) });
+}));
+
 app.post("/api/contacts", authMiddleware, safe(async (req, res) => {
   const { username } = req.body || {};
   const clean = (username || "").trim().toLowerCase();
@@ -321,11 +317,6 @@ app.post("/api/contacts", authMiddleware, safe(async (req, res) => {
 // ---------------------------------------------------------------------------
 // MESSAGES (1:1 chat)
 // ---------------------------------------------------------------------------
-function roomFor(idA, idB) {
-  const [a, b] = [idA, idB].sort((x, y) => x - y);
-  return `chat:${a}:${b}`;
-}
-
 app.get("/api/messages/:username", authMiddleware, safe(async (req, res) => {
   const other = await db.getUserByUsername(req.params.username.trim().toLowerCase());
   if (!other) return res.status(404).json({ error: "User not found." });
@@ -386,6 +377,7 @@ app.post("/api/messages", authMiddleware, safe(async (req, res) => {
   const payload = {
     id: saved.id,
     from: req.username,
+    from_id: req.userId,
     kind: msgKind,
     numbers: numbers || null,
     image: image || null,
@@ -396,7 +388,10 @@ app.post("/api/messages", authMiddleware, safe(async (req, res) => {
     created_at: saved.created_at
   };
 
-  io.to(roomFor(req.userId, other.id)).emit("chat:message", { withUserId: req.userId, message: payload });
+  // Delivered to the recipient's personal room, not a contacts-gated pair
+  // room — so a message from someone you haven't added yet still arrives
+  // live instead of silently sitting in the database until you add them.
+  io.to(`user:${other.id}`).emit("chat:message", { message: payload });
   res.json({ message: payload });
 }));
 
@@ -713,21 +708,13 @@ io.use((socket, next) => {
 });
 
 io.on("connection", (socket) => {
-  (async () => {
-    try {
-      const contacts = await db.getContacts(socket.userId);
-      contacts.forEach(c => socket.join(roomFor(socket.userId, c.id)));
-    } catch (e) {
-      console.error("Error joining contact rooms:", e);
-    }
-  })();
+  // A personal room per user, not per contact-pair — this is what makes
+  // messages from a non-contact arrive live instead of only after the
+  // recipient happens to add that person back.
+  socket.join(`user:${socket.userId}`);
 
   socket.on("meeting:join", (pin) => {
     if (pin) socket.join(`meeting:${pin}`);
-  });
-
-  socket.on("contact:added", (contactId) => {
-    socket.join(roomFor(socket.userId, contactId));
   });
 });
 
