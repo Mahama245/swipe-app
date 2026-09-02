@@ -6,6 +6,9 @@
 <title>SWIPE — encoded messaging</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/12.4.2/math.min.js"></script>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="https://unpkg.com/@simplewebauthn/browser@11/dist/bundle/index.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
@@ -66,6 +69,8 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
 .contact-item{ padding:10px 12px; border-radius:8px; font-size:14px; color:var(--text); cursor:pointer; transition:background .15s ease; display:flex; align-items:center; gap:10px; }
 .contact-item:hover{ background:var(--panel-alt); }
 .contact-item.selected{ background:var(--accent-dim); }
+.qr-share-btn{ margin-left:auto; background:none; border:none; color:var(--muted); font-size:14px; padding:2px 6px; border-radius:6px; }
+.qr-share-btn:hover{ color:var(--accent); background:var(--panel-alt); }
 .contact-avatar{ width:28px; height:28px; border-radius:50%; flex-shrink:0; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; color:#17151C; }
 .btn-secondary{ margin-top:10px; background:var(--panel-alt); border:1px solid var(--border); color:var(--text); font-weight:600; font-size:13px; padding:10px; border-radius:8px; width:100%; transition:border-color .15s ease; }
 .btn-secondary:hover{ border-color:var(--accent); }
@@ -75,6 +80,13 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
 .btn-primary:disabled{ opacity:0.4; cursor:not-allowed; }
 .btn-ghost{ background:transparent; border:1px solid var(--border); color:var(--muted); font-weight:600; font-size:12.5px; padding:8px 14px; border-radius:8px; }
 .btn-ghost:hover{ color:var(--text); border-color:var(--accent); }
+.admin-tab-btn.active{ background:var(--accent-dim); color:var(--text); border-color:var(--accent); }
+.status-pill{ font-size:11px; font-weight:700; padding:3px 9px; border-radius:20px; text-transform:uppercase; letter-spacing:.3px; }
+.status-pill.active{ color:var(--ok); background:var(--ok-dim); border:1px solid var(--ok); }
+.status-pill.suspended{ color:var(--warn); background:rgba(242,166,90,.15); border:1px solid var(--warn); }
+.status-pill.banned{ color:var(--danger); background:rgba(227,103,103,.15); border:1px solid var(--danger); }
+.settings-card{ background:var(--panel-alt); border:1px solid var(--border); border-radius:12px; padding:16px; }
+.settings-title{ font-weight:700; font-size:13.5px; margin-bottom:10px; }
 
 .main{ flex:1; display:flex; flex-direction:column; min-width:0; }
 
@@ -99,6 +111,11 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
 .bubble-row:not(.me) .sender{ text-align:left; }
 .bubble .decode-hint{ font-size:10px; color:var(--muted); margin-top:5px; }
 .bubble img.thumb{ max-width:220px; border-radius:8px; display:block; }
+.bubble video.thumb{ max-width:220px; border-radius:8px; display:block; }
+.file-card{ display:flex; align-items:center; gap:10px; background:var(--panel-alt); border:1px solid var(--border); border-radius:10px; padding:10px 12px; text-decoration:none; color:var(--text); min-width:180px; }
+.file-icon{ font-size:22px; }
+.file-name{ font-size:13px; font-weight:600; word-break:break-all; }
+.contact-card-msg{ display:flex; align-items:center; gap:10px; background:var(--panel-alt); border:1px solid var(--border); border-radius:10px; padding:10px 12px; min-width:180px; }
 
 .compose{ display:flex; gap:8px; padding:14px 18px; border-top:1px solid var(--border); background:var(--panel); flex-shrink:0; flex-wrap:wrap; }
 .compose input[type=text]{ flex:1; min-width:160px; background:var(--panel-alt); border:1px solid var(--border); color:var(--text); padding:11px 14px; border-radius:9px; font-size:14px; }
@@ -166,10 +183,8 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
     <div class="auth-error" id="authError"></div>
     <div class="field"><label>Username</label><input type="text" id="authUsername" placeholder="e.g. mahama" autocomplete="username"></div>
     <div class="field"><label>Password</label><input type="password" id="authPassword" placeholder="••••••••" autocomplete="current-password"></div>
-    <div class="field" id="securityQuestionField" style="display:none;"><label>Security Question</label><input type="text" id="authSecurityQuestion" placeholder="e.g. What was your first pet's name?"></div>
-    <div class="field" id="securityAnswerField" style="display:none;"><label>Answer</label><input type="text" id="authSecurityAnswer" placeholder="Your answer" autocomplete="off"></div>
     <button class="btn-primary" id="authSubmitBtn">Log In</button>
-    <div id="forgotPasswordLink" style="text-align:center; margin-top:12px; font-size:13px; color:var(--muted); cursor:pointer;">Forgot password?</div>
+    <button class="btn-secondary" id="biometricLoginBtn" style="width:100%; margin-top:10px; display:none;">👆 Log in with Face ID / Fingerprint</button>
   </div>
 </div>
 
@@ -191,13 +206,14 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
       </svg>
       <div class="brand">SWIPE</div>
     </div>
-    <div class="me-row"><span id="meLabel"></span><button class="logout" id="logoutBtn">Log out</button></div>
+    <div class="me-row"><span id="meLabel"></span><button class="logout" id="settingsBtn" style="color:var(--accent);">⚙️ Settings</button><button class="logout" id="logoutBtn">Log out</button></div>
+    <button class="btn-secondary" id="enableBiometricBtn" style="width:100%; margin:-4px 0 12px; display:none; font-size:12.5px; padding:8px;">👆 Enable Face ID / Fingerprint</button>
 
     <nav>
       <button class="nav-btn active" data-view="chats">💬 Chats</button>
       <button class="nav-btn" data-view="status">🌀 Status</button>
       <button class="nav-btn" data-view="meeting">🔒 Meeting</button>
-      <button class="nav-btn" data-view="admin" id="adminNavBtn" style="display:none;">🛠️ Admin</button>
+      <button class="nav-btn" data-view="admin" id="adminNavBtn" style="display:none;">🛡️ Admin</button>
     </nav>
 
     <div id="contactsSection">
@@ -221,7 +237,8 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
 let authMode = "login";
 let token = localStorage.getItem("swipe_token") || null;
 let myUsername = localStorage.getItem("swipe_username") || null;
-let isAdmin = false;
+let myAvatar = null;
+let myIsAdmin = false;
 let socket = null;
 
 document.querySelectorAll(".auth-tab").forEach(tab => {
@@ -230,10 +247,6 @@ document.querySelectorAll(".auth-tab").forEach(tab => {
     document.querySelectorAll(".auth-tab").forEach(t => t.classList.toggle("active", t === tab));
     document.getElementById("authSubmitBtn").textContent = authMode === "login" ? "Log In" : "Sign Up";
     document.getElementById("authError").classList.remove("show");
-    const isRegister = authMode === "register";
-    document.getElementById("securityQuestionField").style.display = isRegister ? "block" : "none";
-    document.getElementById("securityAnswerField").style.display = isRegister ? "block" : "none";
-    document.getElementById("forgotPasswordLink").style.display = isRegister ? "none" : "block";
   });
 });
 
@@ -250,27 +263,18 @@ async function submitAuth(){
   const username = document.getElementById("authUsername").value.trim();
   const password = document.getElementById("authPassword").value;
   if (!username || !password){ showAuthError("Enter a username and password."); return; }
-
-  const body = { username, password };
-  if (authMode === "register"){
-    const securityQuestion = document.getElementById("authSecurityQuestion").value.trim();
-    const securityAnswer = document.getElementById("authSecurityAnswer").value.trim();
-    if (!securityQuestion || !securityAnswer){ showAuthError("Please add a security question and answer."); return; }
-    body.securityQuestion = securityQuestion;
-    body.securityAnswer = securityAnswer;
-  }
-
   try{
     const res = await fetch(`/api/${authMode === "login" ? "login" : "register"}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
+      body: JSON.stringify({ username, password })
     });
     const data = await res.json();
     if (!res.ok){ showAuthError(data.error || "Something went wrong."); return; }
     token = data.token;
     myUsername = data.username;
-    isAdmin = !!data.isAdmin;
+    myIsAdmin = !!data.is_admin;
+    myAvatar = data.avatar || null;
     localStorage.setItem("swipe_token", token);
     localStorage.setItem("swipe_username", myUsername);
     enterApp();
@@ -279,55 +283,13 @@ async function submitAuth(){
   }
 }
 
-document.getElementById("forgotPasswordLink").addEventListener("click", () => {
-  openModal({
-    title: "Forgot Password",
-    sub: "Enter your username to see your security question.",
-    fields: [{ id: "username", label: "Username", placeholder: "e.g. mahama" }],
-    submitLabel: "Next",
-    onSubmit: async (values) => {
-      const username = (values.username || "").trim();
-      if (!username) return { error: "Enter your username." };
-      try{
-        const res = await fetch(`/api/forgot-password/${encodeURIComponent(username)}`);
-        const data = await res.json();
-        if (!res.ok) return { error: data.error || "Something went wrong." };
-        showResetModal(username, data.question);
-      }catch(e){
-        return { error: "Couldn't reach the server." };
-      }
-    }
-  });
-});
+document.getElementById("enableBiometricBtn").addEventListener("click", enableBiometricLogin);
 
-function showResetModal(username, question){
-  openModal({
-    title: "Reset Password",
-    sub: question,
-    fields: [
-      { id: "answer", label: "Answer", placeholder: "Your answer" },
-      { id: "newPassword", label: "New Password", type: "password", placeholder: "••••••••" }
-    ],
-    submitLabel: "Reset Password",
-    onSubmit: async (values) => {
-      const answer = (values.answer || "").trim();
-      const newPassword = values.newPassword || "";
-      if (!answer || !newPassword) return { error: "Fill in both fields." };
-      try{
-        const res = await fetch("/api/forgot-password/reset", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username, answer, newPassword })
-        });
-        const data = await res.json();
-        if (!res.ok) return { error: data.error || "Something went wrong." };
-        toast("Password reset. You can log in now.");
-      }catch(e){
-        return { error: "Couldn't reach the server." };
-      }
-    }
-  });
-}
+document.getElementById("settingsBtn").addEventListener("click", () => {
+  currentView = "settings";
+  setActiveNav("settings");
+  showSettingsView();
+});
 
 document.getElementById("logoutBtn").addEventListener("click", () => {
   localStorage.removeItem("swipe_token");
@@ -342,7 +304,8 @@ async function tryAutoLogin(){
     if (!res.ok) throw new Error("bad token");
     const data = await res.json();
     myUsername = data.username;
-    isAdmin = !!data.isAdmin;
+    myIsAdmin = !!data.is_admin;
+    myAvatar = data.avatar || null;
     enterApp();
   }catch(e){
     localStorage.removeItem("swipe_token");
@@ -360,7 +323,14 @@ function enterApp(){
   document.getElementById("smoke").style.display = "";
   document.getElementById("app").style.display = "flex";
   document.getElementById("meLabel").textContent = "@" + myUsername;
-  document.getElementById("adminNavBtn").style.display = isAdmin ? "" : "none";
+
+  if (myIsAdmin) {
+    document.getElementById("adminNavBtn").style.display = "";
+  }
+
+  if (browserSupportsWebAuthn && browserSupportsWebAuthn()){
+    document.getElementById("enableBiometricBtn").style.display = "block";
+  }
 
   socket = io({ auth: { token } });
   socket.on("chat:message", ({ message }) => {
@@ -383,12 +353,83 @@ function enterApp(){
       appendLiveMeetingMessage(msg);
     }
   });
+  socket.on("meeting:closed", ({ pin }) => {
+    if (activeMeeting && activeMeeting.pin === pin) {
+      toast("This meeting was closed by the host or an admin.", true);
+      activeMeeting = null;
+      if (currentView === "meeting") showMeetingView();
+    }
+  });
 
   loadContacts();
   showChatsView();
 }
 
 tryAutoLogin();
+
+// =====================================================================
+// BIOMETRIC LOGIN (Face ID / fingerprint / Windows Hello) via WebAuthn
+// The server never receives or stores any biometric data — only a public
+// key. Your device does the actual Face ID / fingerprint check locally.
+// =====================================================================
+const { startRegistration, startAuthentication, browserSupportsWebAuthn } = SimpleWebAuthnBrowser || {};
+
+(async function initBiometricButton(){
+  const btn = document.getElementById("biometricLoginBtn");
+  if (!browserSupportsWebAuthn || !browserSupportsWebAuthn()) return;
+  btn.style.display = "block";
+})();
+
+document.getElementById("biometricLoginBtn").addEventListener("click", async () => {
+  try {
+    const optRes = await fetch("/api/webauthn/login-options", { method: "POST" });
+    const options = await optRes.json();
+    if (!optRes.ok) { showAuthError(options.error || "Couldn't start biometric login."); return; }
+
+    const authResp = await startAuthentication({ optionsJSON: options });
+
+    const verifyRes = await fetch("/api/webauthn/login-verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(authResp)
+    });
+    const data = await verifyRes.json();
+    if (!verifyRes.ok) { showAuthError(data.error || "Biometric login failed."); return; }
+
+    token = data.token;
+    myUsername = data.username;
+    myIsAdmin = !!data.is_admin;
+    myAvatar = data.avatar || null;
+    localStorage.setItem("swipe_token", token);
+    localStorage.setItem("swipe_username", myUsername);
+    enterApp();
+  } catch (e) {
+    // user cancelled the prompt, or no registered device on this browser
+    if (e.name !== "NotAllowedError") showAuthError("Biometric login isn't set up on this device yet. Log in with your password, then enable it in settings.");
+  }
+});
+
+async function enableBiometricLogin(){
+  try {
+    const optRes = await fetch("/api/webauthn/register-options", { headers: authHeaders() });
+    const options = await optRes.json();
+    if (!optRes.ok) { toast(options.error || "Couldn't start setup.", true); return; }
+
+    const attResp = await startRegistration({ optionsJSON: options });
+    attResp.nickname = prompt("Name this device (e.g. \"My iPhone\"):", "My device") || "My device";
+
+    const verifyRes = await fetch("/api/webauthn/register-verify", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(attResp)
+    });
+    const data = await verifyRes.json();
+    if (!verifyRes.ok) { toast(data.error || "Setup failed.", true); return; }
+    toast("Face ID / fingerprint login enabled on this device ✓");
+  } catch (e) {
+    if (e.name !== "NotAllowedError") toast("Couldn't set up biometric login on this device.", true);
+  }
+}
 
 // =====================================================================
 // CIPHER ENGINE
@@ -578,7 +619,13 @@ function renderContactList(){
   contacts.forEach(c => {
     const item = document.createElement("div");
     item.className = "contact-item" + (c.id === currentContactId ? " selected" : "");
-    item.innerHTML = `<div class="contact-avatar" style="background:${colorFor(c.id)}">${initials(c.username)}</div><span>${c.username}</span>`;
+    item.style.position = "relative";
+    item.innerHTML = `<div class="contact-avatar" style="background:${colorFor(c.id)}">${initials(c.username)}</div><span>${c.username}</span>
+      <button class="qr-share-btn" data-username="${escapeHtml(c.username)}" title="QR code / share">▦</button>`;
+    item.querySelector(".qr-share-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      openContactCard(c);
+    });
     item.addEventListener("click", () => {
       currentContactId = c.id;
       currentView = "chats";
@@ -588,6 +635,59 @@ function renderContactList(){
     });
     list.appendChild(item);
   });
+}
+
+// Shows a contact's QR code, and lets you forward it as a shareable
+// contact card message to one of your other contacts — this is how two
+// of your contacts get introduced to each other.
+function openContactCard(contact){
+  const root = document.getElementById("modalRoot");
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.innerHTML = `
+    <h3>@${escapeHtml(contact.username)}</h3>
+    <div class="modal-sub">Scan to add, or send this contact card to someone else.</div>
+    <div id="contactQrBox" style="display:flex; justify-content:center; padding:10px; background:#fff; border-radius:10px;"></div>
+    <div class="settings-title" style="margin:14px 0 6px;">Send this contact to…</div>
+    <div id="shareTargetList" style="display:flex; flex-direction:column; gap:6px; max-height:180px; overflow-y:auto;"></div>
+    <div class="modal-actions"><button class="btn-ghost" id="contactCardCloseBtn">Close</button></div>`;
+  backdrop.appendChild(modal);
+  root.appendChild(backdrop);
+  document.getElementById("contactCardCloseBtn").addEventListener("click", () => root.removeChild(backdrop));
+
+  new QRCode(document.getElementById("contactQrBox"), {
+    text: QR_PREFIX + contact.username,
+    width: 140, height: 140, colorDark: "#17151C", colorLight: "#ffffff"
+  });
+
+  const targetList = document.getElementById("shareTargetList");
+  const others = contacts.filter(c => c.id !== contact.id);
+  if (!others.length) {
+    targetList.innerHTML = `<div class="hint">Add more contacts to be able to introduce them.</div>`;
+  } else {
+    others.forEach(other => {
+      const btn = document.createElement("button");
+      btn.className = "btn-ghost";
+      btn.style.textAlign = "left";
+      btn.textContent = `@${other.username}`;
+      btn.addEventListener("click", async () => {
+        try{
+          const res = await fetch("/api/messages", {
+            method: "POST",
+            headers: authHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({ to: other.username, kind: "contact", shared_username: contact.username })
+          });
+          const data = await res.json();
+          if (!res.ok) { toast(data.error || "Couldn't send contact.", true); return; }
+          toast(`Sent @${contact.username}'s contact card to @${other.username}.`);
+          if (currentContactId === other.id) appendLiveMessage(data.message);
+        }catch(e){ toast("Couldn't reach the server.", true); }
+      });
+      targetList.appendChild(btn);
+    });
+  }
 }
 
 function setActiveNav(view){
@@ -681,6 +781,361 @@ function showMeetingView(){
   document.getElementById("joinMeetingBtn").addEventListener("click", joinMeeting);
 }
 
+// =====================================================================
+// ADMIN VIEW — meeting access request queue + user management
+// =====================================================================
+let adminTab = "requests";
+
+function showAdminView(){
+  currentView = "admin";
+  const main = document.getElementById("main");
+  main.innerHTML = `
+    <div class="view-header">
+      <h2>🛡️ Admin</h2>
+      <button class="btn-ghost" id="refreshAdminBtn">Refresh</button>
+    </div>
+    <div style="display:flex; gap:8px; padding:0 16px 12px; flex-wrap:wrap;">
+      <button class="btn-ghost admin-tab-btn" data-tab="requests">Meeting Requests</button>
+      <button class="btn-ghost admin-tab-btn" data-tab="users">Users</button>
+      <button class="btn-ghost admin-tab-btn" data-tab="usernames">Username Requests</button>
+      <button class="btn-ghost admin-tab-btn" data-tab="audit">Audit Log</button>
+    </div>
+    <div id="adminTabBody"></div>`;
+  document.querySelectorAll(".admin-tab-btn").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.tab === adminTab);
+    btn.addEventListener("click", () => {
+      adminTab = btn.dataset.tab;
+      document.querySelectorAll(".admin-tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === adminTab));
+      renderAdminTab();
+    });
+  });
+  document.getElementById("refreshAdminBtn").addEventListener("click", () => {
+    if (adminTab === "requests") loadAccessRequests();
+    else if (adminTab === "users") loadAdminUsers();
+    else if (adminTab === "usernames") loadUsernameRequests();
+    else loadAuditLog();
+  });
+  renderAdminTab();
+}
+
+function renderAdminTab(){
+  const body = document.getElementById("adminTabBody");
+  if (adminTab === "requests"){
+    body.innerHTML = `<div id="requestsList" style="padding:16px;"><div class="empty-state"><h3>Loading…</h3></div></div>`;
+    loadAccessRequests();
+  } else if (adminTab === "users") {
+    body.innerHTML = `<div id="usersList" style="padding:16px;"><div class="empty-state"><h3>Loading…</h3></div></div>`;
+    loadAdminUsers();
+  } else if (adminTab === "usernames") {
+    body.innerHTML = `<div id="usernameRequestsList" style="padding:16px;"><div class="empty-state"><h3>Loading…</h3></div></div>`;
+    loadUsernameRequests();
+  } else {
+    body.innerHTML = `<div id="auditLogList" style="padding:16px;"><div class="empty-state"><h3>Loading…</h3></div></div>`;
+    loadAuditLog();
+  }
+}
+
+async function loadAccessRequests(){
+  const list = document.getElementById("requestsList");
+  try{
+    const res = await fetch("/api/admin/meeting-requests", { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) { list.innerHTML = `<div class="empty-state"><h3>${data.error || "Couldn't load requests."}</h3></div>`; return; }
+    renderAccessRequests(data.requests || []);
+  }catch(e){
+    list.innerHTML = `<div class="empty-state"><h3>Couldn't reach the server.</h3></div>`;
+  }
+}
+
+function renderAccessRequests(requests){
+  const list = document.getElementById("requestsList");
+  if (!list) return;
+  if (!requests.length){
+    list.innerHTML = `<div class="empty-state"><h3>No pending requests</h3><div>Nobody is currently waiting for access to a closed meeting.</div></div>`;
+    return;
+  }
+  list.innerHTML = "";
+  requests.forEach(r => {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border:1px solid var(--border); border-radius:10px; margin-bottom:8px; background:var(--panel-alt);";
+    const time = new Date(r.created_at).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+    row.innerHTML = `
+      <div>
+        <div style="font-weight:600;">@${escapeHtml(r.requester_username)}</div>
+        <div class="hint">wants back into meeting PIN <strong>${escapeHtml(r.pin)}</strong> · ${time}</div>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn-primary" data-action="approve" data-id="${r.id}">Approve</button>
+        <button class="btn-ghost" data-action="deny" data-id="${r.id}" style="color:var(--danger,#e5555a);">Delete</button>
+        <button class="btn-ghost" data-action="reopen-all" data-pin="${escapeHtml(r.pin)}">Let Everyone Back In</button>
+      </div>`;
+    row.querySelector('[data-action="approve"]').addEventListener("click", () => resolveRequest(r.id, true));
+    row.querySelector('[data-action="deny"]').addEventListener("click", () => resolveRequest(r.id, false));
+    row.querySelector('[data-action="reopen-all"]').addEventListener("click", () => reopenMeetingForAll(r.pin));
+    list.appendChild(row);
+  });
+}
+
+async function reopenMeetingForAll(pin){
+  if (!confirm(`Let everyone who was ever in meeting PIN ${pin} back in, without reviewing each request individually?`)) return;
+  try{
+    const res = await fetch(`/api/admin/meetings/${encodeURIComponent(pin)}/reopen-for-all`, {
+      method: "POST",
+      headers: authHeaders()
+    });
+    const data = await res.json();
+    if (!res.ok) { toast(data.error || "Couldn't reopen for everyone.", true); return; }
+    toast(`Reopened for ${data.approved_count} past participant(s).`);
+    loadAccessRequests();
+  }catch(e){
+    toast("Couldn't reach the server.", true);
+  }
+}
+
+async function resolveRequest(id, approve){
+  try{
+    const res = await fetch(`/api/admin/meeting-requests/${id}/${approve ? "approve" : "deny"}`, {
+      method: "POST",
+      headers: authHeaders()
+    });
+    const data = await res.json();
+    if (!res.ok) { toast(data.error || "Couldn't update that request.", true); return; }
+    toast(approve ? "Access approved." : "Request deleted.");
+    loadAccessRequests();
+  }catch(e){
+    toast("Couldn't reach the server.", true);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ADMIN — user management (suspend / ban / delete / reset password)
+// ---------------------------------------------------------------------------
+async function loadAdminUsers(){
+  const list = document.getElementById("usersList");
+  if (!list) return;
+  try{
+    const res = await fetch("/api/admin/users", { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) { list.innerHTML = `<div class="empty-state"><h3>${escapeHtml(data.error || "Couldn't load users.")}</h3></div>`; return; }
+    renderAdminUsers(data.users || []);
+  }catch(e){
+    list.innerHTML = `<div class="empty-state"><h3>Couldn't reach the server.</h3></div>`;
+  }
+}
+
+function renderAdminUsers(users){
+  const list = document.getElementById("usersList");
+  if (!list) return;
+  if (!users.length){
+    list.innerHTML = `<div class="empty-state"><h3>No users found</h3></div>`;
+    return;
+  }
+  list.innerHTML = "";
+  users.forEach(u => {
+    const status = u.status || "active";
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border:1px solid var(--border); border-radius:10px; margin-bottom:8px; background:var(--panel-alt); flex-wrap:wrap;";
+    row.innerHTML = `
+      <div>
+        <div style="font-weight:600;">@${escapeHtml(u.username)} ${u.is_admin ? '<span class="hint">(admin)</span>' : ""}</div>
+        <div style="margin-top:4px;"><span class="status-pill ${status}">${status}</span></div>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="btn-ghost" data-action="view-qr">View QR</button>
+        ${status === "active" ? `<button class="btn-ghost" data-action="suspend" style="color:var(--warn);">Suspend</button>` : ""}
+        ${status !== "banned" ? `<button class="btn-ghost" data-action="ban" style="color:var(--danger);">Ban</button>` : ""}
+        ${status !== "active" ? `<button class="btn-ghost" data-action="reactivate" style="color:var(--ok);">Reactivate</button>` : ""}
+        <button class="btn-ghost" data-action="reset-password">Reset Password</button>
+        <button class="btn-ghost" data-action="delete" style="color:var(--danger);">Delete</button>
+      </div>`;
+    const actions = {
+      "view-qr": () => showUserQrModal(u),
+      suspend: () => setUserStatusAction(u, "suspend"),
+      ban: () => setUserStatusAction(u, "ban"),
+      reactivate: () => setUserStatusAction(u, "reactivate"),
+      "reset-password": () => resetUserPasswordAction(u),
+      delete: () => deleteUserAction(u)
+    };
+    Object.entries(actions).forEach(([action, fn]) => {
+      const btn = row.querySelector(`[data-action="${action}"]`);
+      if (btn) btn.addEventListener("click", fn);
+    });
+    list.appendChild(row);
+  });
+}
+
+// Lets an admin pull up any user's QR code — handy for support scenarios
+// (e.g. reading it out, or scanning it from a screenshot the user sent in).
+function showUserQrModal(user){
+  const root = document.getElementById("modalRoot");
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.innerHTML = `
+    <h3>@${escapeHtml(user.username)}</h3>
+    <div class="modal-sub">This user's add-contact QR code.</div>
+    <div id="adminQrBox" style="display:flex; justify-content:center; padding:10px; background:#fff; border-radius:10px;"></div>
+    <div class="modal-actions"><button class="btn-ghost" id="adminQrCloseBtn">Close</button></div>`;
+  backdrop.appendChild(modal);
+  root.appendChild(backdrop);
+  document.getElementById("adminQrCloseBtn").addEventListener("click", () => root.removeChild(backdrop));
+  new QRCode(document.getElementById("adminQrBox"), {
+    text: QR_PREFIX + user.username,
+    width: 160, height: 160, colorDark: "#17151C", colorLight: "#ffffff"
+  });
+}
+
+async function setUserStatusAction(user, action){
+  const verbs = { suspend: "suspend", ban: "ban", reactivate: "reactivate" };
+  if (!confirm(`${verbs[action][0].toUpperCase() + verbs[action].slice(1)} @${user.username}?`)) return;
+  try{
+    const res = await fetch(`/api/admin/users/${user.id}/${action}`, { method: "POST", headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) { toast(data.error || "Couldn't update that user.", true); return; }
+    toast(`@${user.username} updated.`);
+    loadAdminUsers();
+  }catch(e){
+    toast("Couldn't reach the server.", true);
+  }
+}
+
+function deleteUserAction(user){
+  if (!confirm(`Permanently delete @${user.username}'s account? This cannot be undone.`)) return;
+  (async () => {
+    try{
+      const res = await fetch(`/api/admin/users/${user.id}`, { method: "DELETE", headers: authHeaders() });
+      const data = await res.json();
+      if (!res.ok) { toast(data.error || "Couldn't delete that user.", true); return; }
+      toast(`@${user.username} deleted.`);
+      loadAdminUsers();
+    }catch(e){
+      toast("Couldn't reach the server.", true);
+    }
+  })();
+}
+
+function resetUserPasswordAction(user){
+  openModal({
+    title: `Reset password for @${user.username}`,
+    sub: "Set a new password for this account. Share it with the user securely.",
+    fields: [{ id: "new_password", label: "New password", type: "password", placeholder: "At least 4 characters" }],
+    submitLabel: "Reset Password",
+    onSubmit: async (values) => {
+      const new_password = values.new_password || "";
+      if (new_password.length < 4) return { error: "Password must be at least 4 characters." };
+      try{
+        const res = await fetch(`/api/admin/users/${user.id}/reset-password`, {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ new_password })
+        });
+        const data = await res.json();
+        if (!res.ok) return { error: data.error || "Couldn't reset password." };
+        toast(`Password reset for @${user.username}.`);
+      }catch(e){
+        return { error: "Couldn't reach the server." };
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// ADMIN — audit log
+// ---------------------------------------------------------------------------
+const AUDIT_ACTION_LABELS = {
+  suspend_user: "Suspended", ban_user: "Banned", reactivate_user: "Reactivated",
+  delete_user: "Deleted", reset_password: "Reset password for",
+  approve_meeting_request: "Approved access request from", deny_meeting_request: "Denied access request from",
+  reopen_meeting_for_all: "Reopened meeting for everyone",
+  approve_username_change: "Approved username change for", deny_username_change: "Denied username change for"
+};
+
+async function loadAuditLog(){
+  const list = document.getElementById("auditLogList");
+  if (!list) return;
+  try{
+    const res = await fetch("/api/admin/audit-log", { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) { list.innerHTML = `<div class="empty-state"><h3>${escapeHtml(data.error || "Couldn't load the audit log.")}</h3></div>`; return; }
+    renderAuditLog(data.entries || []);
+  }catch(e){
+    list.innerHTML = `<div class="empty-state"><h3>Couldn't reach the server.</h3></div>`;
+  }
+}
+
+function renderAuditLog(entries){
+  const list = document.getElementById("auditLogList");
+  if (!list) return;
+  if (!entries.length){
+    list.innerHTML = `<div class="empty-state"><h3>No admin actions yet</h3><div>Every suspend, ban, delete, password reset, and meeting-request decision will show up here.</div></div>`;
+    return;
+  }
+  list.innerHTML = "";
+  entries.forEach(e => {
+    const time = new Date(e.created_at).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+    const label = AUDIT_ACTION_LABELS[e.action] || e.action;
+    const target = e.target_username ? `@${escapeHtml(e.target_username)}` : (e.target_id != null ? escapeHtml(String(e.target_id)) : "");
+    const row = document.createElement("div");
+    row.style.cssText = "padding:10px 14px; border:1px solid var(--border); border-radius:10px; margin-bottom:8px; background:var(--panel-alt); font-size:12.5px;";
+    row.innerHTML = `
+      <div><strong>@${escapeHtml(e.actor_username)}</strong> ${escapeHtml(label)} ${target}</div>
+      <div class="hint" style="margin-top:3px;">${time}${e.details ? " · " + escapeHtml(e.details) : ""}</div>`;
+    list.appendChild(row);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// ADMIN — username change requests
+// ---------------------------------------------------------------------------
+async function loadUsernameRequests(){
+  const list = document.getElementById("usernameRequestsList");
+  if (!list) return;
+  try{
+    const res = await fetch("/api/admin/username-requests", { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) { list.innerHTML = `<div class="empty-state"><h3>${escapeHtml(data.error || "Couldn't load requests.")}</h3></div>`; return; }
+    renderUsernameRequests(data.requests || []);
+  }catch(e){
+    list.innerHTML = `<div class="empty-state"><h3>Couldn't reach the server.</h3></div>`;
+  }
+}
+
+function renderUsernameRequests(requests){
+  const list = document.getElementById("usernameRequestsList");
+  if (!list) return;
+  if (!requests.length){
+    list.innerHTML = `<div class="empty-state"><h3>No pending requests</h3></div>`;
+    return;
+  }
+  list.innerHTML = "";
+  requests.forEach(r => {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border:1px solid var(--border); border-radius:10px; margin-bottom:8px; background:var(--panel-alt); flex-wrap:wrap;";
+    row.innerHTML = `
+      <div style="font-size:13px;">@${escapeHtml(r.current_username)} <span class="hint">wants to become</span> <strong>@${escapeHtml(r.requested_username)}</strong></div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn-ghost" data-action="approve" style="color:var(--ok);">Approve</button>
+        <button class="btn-ghost" data-action="deny" style="color:var(--danger);">Deny</button>
+      </div>`;
+    row.querySelector('[data-action="approve"]').addEventListener("click", () => resolveUsernameRequestAction(r, "approve"));
+    row.querySelector('[data-action="deny"]').addEventListener("click", () => resolveUsernameRequestAction(r, "deny"));
+    list.appendChild(row);
+  });
+}
+
+async function resolveUsernameRequestAction(request, action){
+  try{
+    const res = await fetch(`/api/admin/username-requests/${request.id}/${action}`, { method: "POST", headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) { toast(data.error || "Couldn't update that request.", true); return; }
+    toast(action === "approve" ? `@${request.current_username} is now @${request.requested_username}.` : "Request denied.");
+    loadUsernameRequests();
+  }catch(e){
+    toast("Couldn't reach the server.", true);
+  }
+}
+
 document.querySelectorAll(".nav-btn").forEach(btn => {
   btn.addEventListener("click", () => {
     setActiveNav(btn.dataset.view);
@@ -690,178 +1145,6 @@ document.querySelectorAll(".nav-btn").forEach(btn => {
     else showMeetingView();
   });
 });
-
-// =====================================================================
-// ADMIN PANEL
-// =====================================================================
-async function showAdminView(){
-  currentView = "admin";
-  const main = document.getElementById("main");
-  main.innerHTML = `
-    <div class="view-header">
-      <h2>Admin — Users</h2>
-    </div>
-    <div id="adminUserList" class="status-list"></div>`;
-  loadAdminUsers();
-}
-
-async function loadAdminUsers(){
-  const list = document.getElementById("adminUserList");
-  list.innerHTML = `<div class="empty-state"><h3>Loading…</h3></div>`;
-  try{
-    const res = await fetch("/api/admin/users", { headers: authHeaders() });
-    const data = await res.json();
-    if (!res.ok){ toast(data.error || "Couldn't load users.", true); return; }
-    renderAdminUserList(data.users || []);
-  }catch(e){ toast("Couldn't reach the server.", true); }
-}
-
-function renderAdminUserList(users){
-  const list = document.getElementById("adminUserList");
-  if (!list) return;
-  if (!users.length){
-    list.innerHTML = `<div class="empty-state"><h3>No users</h3></div>`;
-    return;
-  }
-  list.innerHTML = "";
-  users.forEach(u => list.appendChild(adminUserRowEl(u)));
-}
-
-function adminUserRowEl(u){
-  const row = document.createElement("div");
-  row.className = "status-card";
-  const banned = u.banned_until && new Date(u.banned_until) > new Date();
-  const lastLogin = u.last_login_at ? new Date(u.last_login_at).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "never";
-  row.innerHTML = `
-    <div style="flex:1;">
-      <div class="sauthor">@${escapeHtml(u.username)} ${u.is_admin ? "⭐" : ""} ${banned ? `<span style="color:#ff6b6b;">(banned until ${new Date(u.banned_until).toLocaleString([], { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" })})</span>` : ""}</div>
-      <div class="stime">Last login: ${lastLogin}</div>
-      <div class="admin-actions" style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;"></div>
-    </div>`;
-  const actions = row.querySelector(".admin-actions");
-
-  if (u.username === myUsername){
-    const you = document.createElement("span");
-    you.className = "stime";
-    you.textContent = "(you)";
-    actions.appendChild(you);
-    return row;
-  }
-
-  if (banned){
-    const unbanBtn = document.createElement("button");
-    unbanBtn.className = "btn-secondary";
-    unbanBtn.textContent = "Unban";
-    unbanBtn.addEventListener("click", () => adminUnban(u.id));
-    actions.appendChild(unbanBtn);
-  } else {
-    const banBtn = document.createElement("button");
-    banBtn.className = "btn-secondary";
-    banBtn.textContent = "Ban";
-    banBtn.addEventListener("click", () => adminBanPrompt(u.id, u.username));
-    actions.appendChild(banBtn);
-  }
-
-  const pwBtn = document.createElement("button");
-  pwBtn.className = "btn-secondary";
-  pwBtn.textContent = "Reset Password";
-  pwBtn.addEventListener("click", () => adminResetPasswordPrompt(u.id, u.username));
-  actions.appendChild(pwBtn);
-
-  const delBtn = document.createElement("button");
-  delBtn.className = "btn-secondary";
-  delBtn.textContent = "Delete";
-  delBtn.addEventListener("click", () => adminDeletePrompt(u.id, u.username));
-  actions.appendChild(delBtn);
-
-  return row;
-}
-
-function adminBanPrompt(userId, username){
-  openModal({
-    title: `Ban @${username}`,
-    sub: "Enter how many hours the ban should last.",
-    fields: [{ id: "hours", label: "Duration (hours)", placeholder: "e.g. 24" }],
-    submitLabel: "Ban",
-    onSubmit: async (values) => {
-      const hours = Number(values.hours);
-      if (!hours || hours <= 0) return { error: "Enter a positive number of hours." };
-      try{
-        const res = await fetch(`/api/admin/users/${userId}/ban`, {
-          method: "POST",
-          headers: authHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ hours })
-        });
-        const data = await res.json();
-        if (!res.ok) return { error: data.error || "Couldn't ban user." };
-        toast(`@${username} banned.`);
-        loadAdminUsers();
-      }catch(e){
-        return { error: "Couldn't reach the server." };
-      }
-    }
-  });
-}
-
-async function adminUnban(userId){
-  try{
-    const res = await fetch(`/api/admin/users/${userId}/unban`, {
-      method: "POST",
-      headers: authHeaders()
-    });
-    const data = await res.json();
-    if (!res.ok){ toast(data.error || "Couldn't unban user.", true); return; }
-    toast("User unbanned.");
-    loadAdminUsers();
-  }catch(e){ toast("Couldn't reach the server.", true); }
-}
-
-function adminResetPasswordPrompt(userId, username){
-  openModal({
-    title: `Reset password for @${username}`,
-    fields: [{ id: "newPassword", label: "New Password", type: "password", placeholder: "••••••••" }],
-    submitLabel: "Reset",
-    onSubmit: async (values) => {
-      const newPassword = values.newPassword || "";
-      if (newPassword.length < 6) return { error: "Password must be at least 6 characters." };
-      try{
-        const res = await fetch(`/api/admin/users/${userId}/password`, {
-          method: "POST",
-          headers: authHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ newPassword })
-        });
-        const data = await res.json();
-        if (!res.ok) return { error: data.error || "Couldn't reset password." };
-        toast(`Password reset for @${username}.`);
-      }catch(e){
-        return { error: "Couldn't reach the server." };
-      }
-    }
-  });
-}
-
-function adminDeletePrompt(userId, username){
-  openModal({
-    title: `Delete @${username}?`,
-    sub: "This permanently removes the account, their contacts, messages, and statuses. This can't be undone.",
-    fields: [],
-    submitLabel: "Delete",
-    onSubmit: async () => {
-      try{
-        const res = await fetch(`/api/admin/users/${userId}`, {
-          method: "DELETE",
-          headers: authHeaders()
-        });
-        const data = await res.json();
-        if (!res.ok) return { error: data.error || "Couldn't delete user." };
-        toast(`@${username} deleted.`);
-        loadAdminUsers();
-      }catch(e){
-        return { error: "Couldn't reach the server." };
-      }
-    }
-  });
-}
 document.getElementById("addContactBtn").addEventListener("click", () => {
   openModal({
     title: "Add Contact",
@@ -888,9 +1171,292 @@ document.getElementById("addContactBtn").addEventListener("click", () => {
   });
 });
 
+// Shared by the manual "+ Add Contact" form, QR scanning, and tapping
+// "Add contact" on a shared contact card in a chat.
+async function addContactByUsername(username){
+  const clean = (username || "").trim().toLowerCase();
+  if (!clean) return { error: "No username given." };
+  try{
+    const res = await fetch("/api/contacts", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ username: clean })
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: data.error || "Couldn't add contact." };
+    if (socket) socket.emit("contact:added", data.contact.id);
+    await loadContacts();
+    return { contact: data.contact };
+  }catch(e){
+    return { error: "Couldn't reach the server." };
+  }
+}
+
 // =====================================================================
-// CHAT VIEW
+// SETTINGS — profile picture, QR add/share, password, username request
 // =====================================================================
+const QR_PREFIX = "SWIPE_CONTACT:";
+
+async function showSettingsView(){
+  const main = document.getElementById("main");
+  main.innerHTML = `
+    <div class="view-header"><h2>⚙️ Settings</h2></div>
+    <div style="padding:16px; display:flex; flex-direction:column; gap:20px; max-width:480px;">
+
+      <div class="settings-card">
+        <div class="settings-title">Profile picture</div>
+        <div style="display:flex; align-items:center; gap:14px;">
+          <div id="avatarPreview"></div>
+          <div style="display:flex; flex-direction:column; gap:6px;">
+            <button class="btn-ghost" id="changeAvatarBtn">Choose Photo</button>
+            <button class="btn-ghost" id="removeAvatarBtn" style="color:var(--danger);">Remove</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-card">
+        <div class="settings-title">Your QR code</div>
+        <div class="hint" style="margin-bottom:10px;">Let someone scan this to add you, or share it as a contact card in a chat.</div>
+        <div id="myQrBox" style="display:flex; justify-content:center; padding:10px; background:#fff; border-radius:10px; width:fit-content;"></div>
+        <button class="btn-primary" id="scanToAddBtn" style="margin-top:12px;">📷 Scan a Code to Add</button>
+      </div>
+
+      <div class="settings-card">
+        <div class="settings-title">Change password</div>
+        <button class="btn-ghost" id="changePasswordBtn">Change Password</button>
+      </div>
+
+      <div class="settings-card">
+        <div class="settings-title">Username</div>
+        <div id="usernameStatus"></div>
+      </div>
+
+    </div>`;
+
+  renderAvatarPreview();
+  new QRCode(document.getElementById("myQrBox"), {
+    text: QR_PREFIX + myUsername,
+    width: 160, height: 160, colorDark: "#17151C", colorLight: "#ffffff"
+  });
+
+  document.getElementById("changeAvatarBtn").addEventListener("click", chooseAvatarPhoto);
+  document.getElementById("removeAvatarBtn").addEventListener("click", removeAvatar);
+  document.getElementById("scanToAddBtn").addEventListener("click", openQrScanner);
+  document.getElementById("changePasswordBtn").addEventListener("click", promptChangePassword);
+
+  loadUsernameStatus();
+}
+
+function renderAvatarPreview(){
+  const el = document.getElementById("avatarPreview");
+  if (!el) return;
+  if (myAvatar) {
+    el.innerHTML = `<img src="${myAvatar}" style="width:64px; height:64px; border-radius:50%; object-fit:cover; display:block;">`;
+  } else {
+    el.innerHTML = `<div class="contact-avatar" style="width:64px; height:64px; font-size:20px; background:${colorFor(1)}">${initials(myUsername)}</div>`;
+  }
+}
+
+// Resizes/compresses the chosen image client-side before it ever leaves
+// the device, so avatars stay small regardless of the original photo size.
+function resizeImageFile(file, maxDim, quality){
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > height && width > maxDim) { height = Math.round(height * (maxDim / width)); width = maxDim; }
+        else if (height > maxDim) { width = Math.round(width * (maxDim / height)); height = maxDim; }
+        const canvas = document.createElement("canvas");
+        canvas.width = width; canvas.height = height;
+        canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = reject;
+      img.src = reader.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function chooseAvatarPhoto(){
+  const fileInput = document.getElementById("fileInput");
+  fileInput.accept = "image/*";
+  fileInput.onchange = async () => {
+    const file = fileInput.files[0];
+    fileInput.value = "";
+    if (!file) return;
+    try{
+      const dataUrl = await resizeImageFile(file, 320, 0.85);
+      const res = await fetch("/api/me/avatar", {
+        method: "PATCH",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ avatar: dataUrl })
+      });
+      const data = await res.json();
+      if (!res.ok) { toast(data.error || "Couldn't update photo.", true); return; }
+      myAvatar = data.avatar;
+      renderAvatarPreview();
+      toast("Profile picture updated.");
+    }catch(e){ toast("Couldn't reach the server.", true); }
+  };
+  fileInput.click();
+}
+
+async function removeAvatar(){
+  try{
+    const res = await fetch("/api/me/avatar", {
+      method: "PATCH",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ avatar: null })
+    });
+    const data = await res.json();
+    if (!res.ok) { toast(data.error || "Couldn't remove photo.", true); return; }
+    myAvatar = null;
+    renderAvatarPreview();
+    toast("Profile picture removed.");
+  }catch(e){ toast("Couldn't reach the server.", true); }
+}
+
+function promptChangePassword(){
+  openModal({
+    title: "Change Password",
+    fields: [
+      { id: "current", label: "Current password", type: "password" },
+      { id: "next", label: "New password", type: "password", placeholder: "At least 4 characters" }
+    ],
+    submitLabel: "Change Password",
+    onSubmit: async (v) => {
+      if (!v.next || v.next.length < 4) return { error: "New password must be at least 4 characters." };
+      try{
+        const res = await fetch("/api/me/change-password", {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ current_password: v.current, new_password: v.next })
+        });
+        const data = await res.json();
+        if (!res.ok) return { error: data.error || "Couldn't change password." };
+        toast("Password changed.");
+      }catch(e){
+        return { error: "Couldn't reach the server." };
+      }
+    }
+  });
+}
+
+async function loadUsernameStatus(){
+  const box = document.getElementById("usernameStatus");
+  if (!box) return;
+  try{
+    const res = await fetch("/api/me/username-request", { headers: authHeaders() });
+    const data = await res.json();
+    if (data.request) {
+      box.innerHTML = `<div class="hint">Current: <strong>@${escapeHtml(myUsername)}</strong></div>
+        <div class="hint" style="margin-top:6px; color:var(--warn);">Pending admin approval: @${escapeHtml(data.request.requested_username)}</div>`;
+    } else {
+      box.innerHTML = `<div class="hint" style="margin-bottom:10px;">Current: <strong>@${escapeHtml(myUsername)}</strong></div>
+        <button class="btn-ghost" id="requestUsernameBtn">Request Username Change</button>`;
+      document.getElementById("requestUsernameBtn").addEventListener("click", promptUsernameChange);
+    }
+  }catch(e){ box.innerHTML = `<div class="hint">Couldn't load username status.</div>`; }
+}
+
+function promptUsernameChange(){
+  openModal({
+    title: "Request Username Change",
+    sub: "An admin needs to approve this before it takes effect.",
+    fields: [{ id: "username", label: "New username", placeholder: "e.g. ama2" }],
+    submitLabel: "Submit Request",
+    onSubmit: async (v) => {
+      if (!v.username || v.username.trim().length < 3) return { error: "Username must be at least 3 characters." };
+      try{
+        const res = await fetch("/api/me/username-request", {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ requested_username: v.username.trim() })
+        });
+        const data = await res.json();
+        if (!res.ok) return { error: data.error || "Couldn't submit request." };
+        toast("Request submitted for admin approval.");
+        loadUsernameStatus();
+      }catch(e){
+        return { error: "Couldn't reach the server." };
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// QR SCANNING — "scan a code to add"
+// ---------------------------------------------------------------------------
+function openQrScanner(){
+  const root = document.getElementById("modalRoot");
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.innerHTML = `
+    <h3>Scan to Add</h3>
+    <div class="modal-sub">Point your camera at someone's SWIPE QR code.</div>
+    <div style="position:relative; border-radius:10px; overflow:hidden; background:#000;">
+      <video id="qrVideo" style="width:100%; display:block;" playsinline muted></video>
+    </div>
+    <div class="modal-error" id="qrError"></div>
+    <div class="modal-actions"><button class="btn-ghost" id="qrCancelBtn">Cancel</button></div>`;
+  backdrop.appendChild(modal);
+  root.appendChild(backdrop);
+
+  const video = document.getElementById("qrVideo");
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  let stream = null;
+  let stopped = false;
+
+  function stop(){
+    stopped = true;
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (root.contains(backdrop)) root.removeChild(backdrop);
+  }
+
+  document.getElementById("qrCancelBtn").addEventListener("click", stop);
+
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+    .then(s => {
+      stream = s;
+      video.srcObject = s;
+      video.play();
+      requestAnimationFrame(tick);
+    })
+    .catch(() => {
+      document.getElementById("qrError").textContent = "Couldn't access the camera. Check your browser permissions.";
+      document.getElementById("qrError").classList.add("show");
+    });
+
+  function tick(){
+    if (stopped) return;
+    if (video.readyState === video.HAVE_ENOUGH_DATA) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(imageData.data, imageData.width, imageData.height);
+      if (code && code.data && code.data.startsWith(QR_PREFIX)) {
+        const username = code.data.slice(QR_PREFIX.length);
+        stop();
+        addContactByUsername(username).then(result => {
+          if (result.error) toast(result.error, true);
+          else toast(`Added @${result.contact.username}.`);
+        });
+        return;
+      }
+    }
+    requestAnimationFrame(tick);
+  }
+}
+
+
 async function renderChatView(contact){
   const main = document.getElementById("main");
   main.innerHTML = `
@@ -901,14 +1467,14 @@ async function renderChatView(contact){
     <div class="chat-scroll" id="chatScroll"><div class="empty-state"><h3>Loading…</h3></div></div>
     <div class="compose">
       <input type="text" id="msgInput" placeholder="Type a message…">
-      <button class="btn-ghost" id="mediaBtn">📎 Photo</button>
+      <button class="btn-ghost" id="attachBtn">📎 Attach</button>
       <button class="btn-primary" id="sendBtn">Send</button>
     </div>`;
 
   const input = document.getElementById("msgInput");
   document.getElementById("sendBtn").addEventListener("click", () => sendText(contact, input));
   input.addEventListener("keydown", e => { if (e.key === "Enter") sendText(contact, input); });
-  document.getElementById("mediaBtn").addEventListener("click", () => sendMedia(contact));
+  document.getElementById("attachBtn").addEventListener("click", () => openAttachMenu(contact));
 
   try{
     const res = await fetch(`/api/messages/${encodeURIComponent(contact.username)}`, { headers: authHeaders() });
@@ -927,6 +1493,14 @@ function appendLiveMessage(msg){
   scroll.scrollTop = scroll.scrollHeight;
 }
 
+function humanFileSize(bytes){
+  if (!bytes) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  while (bytes >= 1024 && i < units.length - 1) { bytes /= 1024; i++; }
+  return bytes.toFixed(bytes >= 10 || i === 0 ? 0 : 1) + " " + units[i];
+}
+
 function renderBubble(msg){
   const row = document.createElement("div");
   row.className = "bubble-row" + (msg.from === "You" || msg.from === myUsername ? " me" : "");
@@ -940,9 +1514,111 @@ function renderBubble(msg){
     bubble.addEventListener("click", () => revealMessage(msg));
   } else if (msg.kind === "image"){
     bubble.innerHTML = `<img class="thumb" src="${msg.image}"><div class="sender">${msg.from}</div>`;
+  } else if (msg.kind === "video"){
+    bubble.innerHTML = `<video class="thumb" controls src="${msg.file_data}"></video><div class="sender">${msg.from}</div>`;
+  } else if (msg.kind === "file"){
+    bubble.innerHTML = `
+      <a class="file-card" href="${msg.file_data}" download="${escapeHtml(msg.file_name || "file")}">
+        <span class="file-icon">📄</span>
+        <span>
+          <div class="file-name">${escapeHtml(msg.file_name || "File")}</div>
+          <div class="hint">Tap to download</div>
+        </span>
+      </a>
+      <div class="sender">${msg.from}</div>`;
+  } else if (msg.kind === "contact"){
+    const isMine = msg.from === "You" || msg.from === myUsername;
+    bubble.innerHTML = `
+      <div class="contact-card-msg">
+        <div class="contact-avatar" style="background:${colorFor(1)}">${initials(msg.shared_username || "?")}</div>
+        <div>
+          <div style="font-weight:600;">@${escapeHtml(msg.shared_username || "unknown")}</div>
+          <div class="hint">Shared contact</div>
+        </div>
+      </div>
+      ${!isMine ? `<button class="btn-ghost add-shared-contact-btn" style="margin-top:8px;">+ Add contact</button>` : ""}
+      <div class="sender">${msg.from}</div>`;
+    const addBtn = bubble.querySelector(".add-shared-contact-btn");
+    if (addBtn) {
+      addBtn.addEventListener("click", async () => {
+        const result = await addContactByUsername(msg.shared_username);
+        if (result.error) { toast(result.error, true); return; }
+        toast(`Added @${result.contact.username}.`);
+        addBtn.textContent = "Added";
+        addBtn.disabled = true;
+      });
+    }
   }
   row.appendChild(bubble);
   return row;
+}
+
+function openAttachMenu(contact){
+  const root = document.getElementById("modalRoot");
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.innerHTML = `
+    <h3>Attach</h3>
+    <div style="display:flex; flex-direction:column; gap:8px; margin-top:6px;">
+      <button class="btn-ghost" data-kind="image" style="text-align:left;">🖼️ Photo</button>
+      <button class="btn-ghost" data-kind="video" style="text-align:left;">🎬 Video</button>
+      <button class="btn-ghost" data-kind="file" style="text-align:left;">📄 File</button>
+      <button class="btn-ghost" data-kind="contact" style="text-align:left;">👤 Contact</button>
+    </div>
+    <div class="modal-actions"><button class="btn-ghost" id="attachCancelBtn">Cancel</button></div>`;
+  backdrop.appendChild(modal);
+  root.appendChild(backdrop);
+  function close(){ if (root.contains(backdrop)) root.removeChild(backdrop); }
+  document.getElementById("attachCancelBtn").addEventListener("click", close);
+  modal.querySelectorAll("[data-kind]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const kind = btn.dataset.kind;
+      close();
+      if (kind === "contact") pickContactToShare(contact);
+      else sendMedia(contact, kind);
+    });
+  });
+}
+
+function pickContactToShare(contact){
+  if (!contacts.length) { toast("You don't have any contacts to share yet.", true); return; }
+  const root = document.getElementById("modalRoot");
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.innerHTML = `
+    <h3>Share a contact</h3>
+    <div class="modal-sub">Which of your contacts do you want to introduce @${escapeHtml(contact.username)} to?</div>
+    <div id="shareContactList" style="display:flex; flex-direction:column; gap:6px; max-height:220px; overflow-y:auto; margin-top:8px;"></div>
+    <div class="modal-actions"><button class="btn-ghost" id="shareContactCancelBtn">Cancel</button></div>`;
+  backdrop.appendChild(modal);
+  root.appendChild(backdrop);
+  function close(){ if (root.contains(backdrop)) root.removeChild(backdrop); }
+  document.getElementById("shareContactCancelBtn").addEventListener("click", close);
+  const list = document.getElementById("shareContactList");
+  contacts.forEach(c => {
+    const btn = document.createElement("button");
+    btn.className = "btn-ghost";
+    btn.style.textAlign = "left";
+    btn.textContent = "@" + c.username;
+    btn.addEventListener("click", async () => {
+      close();
+      try{
+        const res = await fetch("/api/messages", {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ to: contact.username, kind: "contact", shared_username: c.username })
+        });
+        const data = await res.json();
+        if (!res.ok) { toast(data.error || "Couldn't send contact.", true); return; }
+        appendLiveMessage(data.message);
+      }catch(e){ toast("Couldn't reach the server.", true); }
+    });
+    list.appendChild(btn);
+  });
 }
 
 function sendText(contact, input){
@@ -974,26 +1650,43 @@ function sendText(contact, input){
   });
 }
 
-function sendMedia(contact){
+// Client-side guard before we even try to base64-encode + upload — the
+// server has the real limit (20MB JSON body), this just fails fast with a
+// friendlier message instead of a slow encode followed by a server error.
+// MongoDB caps a single document at 16MB, and base64 encoding inflates raw
+// file bytes by about a third — so this stays well under that ceiling
+// (leaving room for the rest of the message document) instead of letting
+// uploads intermittently fail once they hit the database.
+const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+
+function sendMedia(contact, kind){
   const fileInput = document.getElementById("fileInput");
+  fileInput.accept = kind === "video" ? "video/*" : kind === "file" ? "*/*" : "image/*";
   fileInput.onchange = () => {
     const file = fileInput.files[0];
+    fileInput.value = "";
     if (!file) return;
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      toast(`That file is too large (max ${humanFileSize(MAX_ATTACHMENT_BYTES)}).`, true);
+      return;
+    }
     const reader = new FileReader();
     reader.onload = async () => {
       try{
+        const body = kind === "image"
+          ? { to: contact.username, kind: "image", image: reader.result }
+          : { to: contact.username, kind, file_data: reader.result, file_name: file.name, file_type: file.type };
         const res = await fetch("/api/messages", {
           method: "POST",
           headers: authHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ to: contact.username, kind: "image", image: reader.result })
+          body: JSON.stringify(body)
         });
         const data = await res.json();
-        if (!res.ok){ toast(data.error || "Couldn't send photo.", true); return; }
+        if (!res.ok){ toast(data.error || "Couldn't send attachment.", true); return; }
         appendLiveMessage(data.message);
       }catch(e){ toast("Couldn't reach the server.", true); }
     };
     reader.readAsDataURL(file);
-    fileInput.value = "";
   };
   fileInput.click();
 }
@@ -1067,10 +1760,18 @@ function promptStatusImage(text){
 function hostMeeting(){
   openModal({
     title: "Host Meeting",
-    fields: [{ id: "pin", label: "Set a PIN (4+ characters)", placeholder: "1234" }],
+    fields: [
+      { id: "pin", label: "Set a PIN (4+ characters)", placeholder: "1234" },
+      { id: "cap", label: "Max people allowed to join (optional)", placeholder: "Leave blank for no limit" },
+    ],
     submitLabel: "Next",
     onSubmit: (v) => {
       if (!v.pin || v.pin.trim().length < 4) return { error: "PIN must be at least 4 characters." };
+      let cap = null;
+      if (v.cap && v.cap.trim()) {
+        cap = parseInt(v.cap.trim(), 10);
+        if (!Number.isInteger(cap) || cap < 1) return { error: "Max people must be a whole number of 1 or more." };
+      }
       const pin = v.pin.trim();
       openModal({
         title: "One-Time Formula",
@@ -1083,11 +1784,11 @@ function hostMeeting(){
             const res = await fetch("/api/meetings", {
               method: "POST",
               headers: authHeaders({ "Content-Type": "application/json" }),
-              body: JSON.stringify({ pin })
+              body: JSON.stringify({ pin, max_participants: cap })
             });
             const data = await res.json();
             if (!res.ok) return { error: data.error || "Couldn't start meeting." };
-            activeMeeting = { pin, formula: v2.formula.trim(), rendered: new Set() };
+            activeMeeting = { pin, formula: v2.formula.trim(), rendered: new Set(), isHost: true, maxParticipants: cap };
             socket.emit("meeting:join", pin);
             toast("Meeting is live. Share the PIN and formula with your friends.");
             if (currentView === "meeting") showMeetingView();
@@ -1112,7 +1813,16 @@ function joinMeeting(){
           headers: authHeaders()
         });
         const data = await res.json();
-        if (!res.ok) return { error: data.error || "Couldn't join meeting." };
+        if (!res.ok) {
+          if (data.closed) {
+            offerRequestAccess(pin);
+            return { error: "This meeting is closed. Check the request you just sent, or ask the host/admin." };
+          }
+          if (data.full) {
+            return { error: "This meeting is full. Ask the host to raise the limit or reset it." };
+          }
+          return { error: data.error || "Couldn't join meeting." };
+        }
         openModal({
           title: "One-Time Formula",
           sub: "Enter the meeting's formula (get it from whoever is hosting).",
@@ -1120,7 +1830,7 @@ function joinMeeting(){
           submitLabel: "Join",
           onSubmit: (v2) => {
             if (!validateFormula(v2.formula)) return { error: "Enter a valid formula." };
-            activeMeeting = { pin, formula: v2.formula.trim(), rendered: new Set() };
+            activeMeeting = { pin, formula: v2.formula.trim(), rendered: new Set(), isHost: false };
             socket.emit("meeting:join", pin);
             toast("You're in. Messages decode automatically for the rest of this meeting.");
             if (currentView === "meeting") showMeetingView();
@@ -1132,8 +1842,29 @@ function joinMeeting(){
     }
   });
 }
+
+// Called when a join attempt hits a closed meeting. Fires the request
+// immediately (idempotent server-side — repeat clicks won't spam duplicates)
+// so the person doesn't have to find a separate button for it.
+async function offerRequestAccess(pin){
+  try{
+    const res = await fetch(`/api/meetings/${encodeURIComponent(pin)}/request-access`, {
+      method: "POST",
+      headers: authHeaders()
+    });
+    if (res.ok) {
+      toast("Access request sent. An admin will need to approve it before you can rejoin.");
+    } else {
+      const data = await res.json();
+      toast(data.error || "Couldn't send the access request.", true);
+    }
+  }catch(e){
+    toast("Couldn't reach the server to send the request.", true);
+  }
+}
 async function renderMeetingChat(){
   const main = document.getElementById("main");
+  const canManage = activeMeeting.isHost || myIsAdmin;
   main.innerHTML = `
     <div class="view-header">
       <div style="display:flex; align-items:center; gap:10px;">
@@ -1141,8 +1872,17 @@ async function renderMeetingChat(){
         <span class="meeting-pin-chip">PIN ${activeMeeting.pin}</span>
         <span class="hint">unlocked for this session</span>
       </div>
-      <button class="btn-ghost" id="endMeetingBtn">Leave Meeting</button>
+      <div style="display:flex; gap:8px;">
+        ${canManage ? `<button class="btn-ghost" id="closeMeetingBtn" style="color:var(--danger,#e5555a);">Close Meeting</button>` : ""}
+        <button class="btn-ghost" id="endMeetingBtn">Leave Meeting</button>
+      </div>
     </div>
+    ${canManage ? `
+    <div style="display:flex; align-items:center; gap:10px; padding:10px 16px; border-bottom:1px solid var(--border); font-size:13px;">
+      <span class="hint" id="capacityStatus">Checking capacity…</span>
+      <button class="btn-ghost" id="setCapacityBtn" style="padding:4px 10px; font-size:12px;">Set Limit</button>
+      <button class="btn-ghost" id="resetCapacityBtn" style="padding:4px 10px; font-size:12px;">Reset Count</button>
+    </div>` : ""}
     <div class="chat-scroll" id="meetingScroll"><div class="empty-state"><h3>Loading…</h3></div></div>
     <div class="compose">
       <input type="text" id="meetingInput" placeholder="Type a message…">
@@ -1156,10 +1896,82 @@ async function renderMeetingChat(){
     activeMeeting = null;
     showMeetingView();
   });
+  if (canManage) {
+    document.getElementById("closeMeetingBtn").addEventListener("click", async () => {
+      if (!confirm("Close this meeting? Nobody — including you — will be able to rejoin without an admin approving a request.")) return;
+      try{
+        const res = await fetch(`/api/meetings/${encodeURIComponent(activeMeeting.pin)}/close`, {
+          method: "POST",
+          headers: authHeaders()
+        });
+        const data = await res.json();
+        if (!res.ok) { toast(data.error || "Couldn't close the meeting.", true); return; }
+        toast("Meeting closed. Only an admin can let anyone back in now.");
+        activeMeeting = null;
+        showMeetingView();
+      }catch(e){
+        toast("Couldn't reach the server.", true);
+      }
+    });
+    document.getElementById("setCapacityBtn").addEventListener("click", () => {
+      openModal({
+        title: "Set Join Limit",
+        sub: "Once this many people have joined, nobody else can get in until you reset the count.",
+        fields: [{ id: "cap", label: "Max people (leave blank for no limit)", placeholder: "e.g. 10" }],
+        submitLabel: "Save",
+        onSubmit: async (v) => {
+          let cap = null;
+          if (v.cap && v.cap.trim()) {
+            cap = parseInt(v.cap.trim(), 10);
+            if (!Number.isInteger(cap) || cap < 1) return { error: "Enter a whole number of 1 or more." };
+          }
+          try{
+            const res = await fetch(`/api/meetings/${encodeURIComponent(activeMeeting.pin)}/capacity`, {
+              method: "PATCH",
+              headers: authHeaders({ "Content-Type": "application/json" }),
+              body: JSON.stringify({ max_participants: cap })
+            });
+            const data = await res.json();
+            if (!res.ok) return { error: data.error || "Couldn't update the limit." };
+            toast(cap ? `Join limit set to ${cap}.` : "Join limit removed.");
+            refreshCapacityStatus();
+          }catch(e){
+            return { error: "Couldn't reach the server." };
+          }
+        }
+      });
+    });
+    document.getElementById("resetCapacityBtn").addEventListener("click", async () => {
+      if (!confirm("Reset the headcount? This lets new people join again up to the same limit.")) return;
+      try{
+        const res = await fetch(`/api/meetings/${encodeURIComponent(activeMeeting.pin)}/reset-capacity`, {
+          method: "POST",
+          headers: authHeaders()
+        });
+        const data = await res.json();
+        if (!res.ok) { toast(data.error || "Couldn't reset.", true); return; }
+        toast("Headcount reset.");
+        refreshCapacityStatus();
+      }catch(e){
+        toast("Couldn't reach the server.", true);
+      }
+    });
+    refreshCapacityStatus();
+  }
 
   try{
     const res = await fetch(`/api/meetings/${encodeURIComponent(activeMeeting.pin)}/messages`, { headers: authHeaders() });
     const data = await res.json();
+    if (!res.ok) {
+      if (data.closed) {
+        toast("This meeting was just closed.", true);
+        activeMeeting = null;
+        showMeetingView();
+        return;
+      }
+      toast(data.error || "Couldn't load meeting history.", true);
+      return;
+    }
     const scroll = document.getElementById("meetingScroll");
     scroll.innerHTML = "";
     (data.messages || []).forEach(msg => {
@@ -1187,6 +1999,21 @@ function appendLiveMeetingMessage(msg){
   scroll.appendChild(meetingBubbleEl(msg));
   scroll.scrollTop = scroll.scrollHeight;
 }
+async function refreshCapacityStatus(){
+  const el = document.getElementById("capacityStatus");
+  if (!el || !activeMeeting) return;
+  try{
+    const res = await fetch(`/api/meetings/${encodeURIComponent(activeMeeting.pin)}/capacity`, { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) { el.textContent = "Couldn't load capacity."; return; }
+    el.textContent = data.max_participants
+      ? `${data.participant_count} / ${data.max_participants} joined`
+      : `${data.participant_count} joined · no limit set`;
+  }catch(e){
+    el.textContent = "Couldn't load capacity.";
+  }
+}
+
 async function sendMeetingMessage(input){
   const text = input.value.trim();
   if (!text) return;
@@ -1199,7 +2026,11 @@ async function sendMeetingMessage(input){
       body: JSON.stringify({ numbers })
     });
     const data = await res.json();
-    if (!res.ok){ toast(data.error || "Couldn't send.", true); return; }
+    if (!res.ok){
+      toast(data.error || "Couldn't send.", true);
+      if (data.closed) { activeMeeting = null; showMeetingView(); }
+      return;
+    }
     input.value = "";
     activeMeeting.rendered.add(data.message.id);
     const scroll = document.getElementById("meetingScroll");
