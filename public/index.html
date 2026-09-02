@@ -87,6 +87,9 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
 .status-pill.banned{ color:var(--danger); background:rgba(227,103,103,.15); border:1px solid var(--danger); }
 .settings-card{ background:var(--panel-alt); border:1px solid var(--border); border-radius:12px; padding:16px; }
 .settings-title{ font-weight:700; font-size:13.5px; margin-bottom:10px; }
+.contact-request-card{ display:flex; align-items:center; gap:10px; background:var(--accent-dim); border:1px solid var(--accent); border-radius:10px; padding:10px 12px; margin-bottom:8px; }
+.participant-row{ display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid var(--border); border-radius:10px; margin-bottom:8px; cursor:pointer; }
+.participant-row:hover{ background:var(--panel-alt); }
 
 .main{ flex:1; display:flex; flex-direction:column; min-width:0; }
 
@@ -344,6 +347,15 @@ function enterApp(){
   socket.on("status:new", (s) => {
     if (currentView === "status") prependStatus(s);
   });
+  socket.on("contact-request:new", (req) => {
+    toast(`@${req.from_username} wants to add you as a contact.`);
+    if (currentView === "chats" && !getChatPartner(currentContactId)) renderConversationInbox();
+  });
+  socket.on("contact-request:accepted", ({ by_username }) => {
+    toast(`@${by_username} accepted your contact request.`);
+    loadContacts();
+    if (currentView === "chats" && !getChatPartner(currentContactId)) renderConversationInbox();
+  });
   socket.on("meeting:message", (msg) => {
     if (currentView === "meeting" && activeMeeting && msg.sender_username !== myUsername){
       appendLiveMeetingMessage(msg);
@@ -491,6 +503,7 @@ function formatNumbers(numbers){
 // =====================================================================
 let contacts = [];              // { id, username }
 let conversations = [];         // { id, username, is_contact, last_message } — everyone you've exchanged a message with
+let pendingContactRequests = []; // { id, from_id, from_username, created_at } — incoming, awaiting your accept/decline
 let currentContactId = null;
 let currentView = "chats";
 let activeMeeting = null;       // { pin, formula }
@@ -719,11 +732,19 @@ function conversationPreviewText(c){
 async function renderConversationInbox(){
   const main = document.getElementById("main");
   main.innerHTML = `<div class="view-header"><h2>💬 Chats</h2></div>
+    <div id="requestsBlock" style="padding:16px 16px 0;"></div>
     <div id="conversationList" style="padding:16px;"><div class="empty-state"><h3>Loading…</h3></div></div>`;
   try{
-    const res = await fetch("/api/conversations", { headers: authHeaders() });
-    const data = await res.json();
-    conversations = data.conversations || [];
+    const [convRes, reqRes] = await Promise.all([
+      fetch("/api/conversations", { headers: authHeaders() }),
+      fetch("/api/contact-requests", { headers: authHeaders() })
+    ]);
+    const convData = await convRes.json();
+    const reqData = await reqRes.json();
+    conversations = convData.conversations || [];
+    pendingContactRequests = reqData.requests || [];
+    renderPendingContactRequests();
+
     const list = document.getElementById("conversationList");
     if (!conversations.length){
       list.innerHTML = `<div class="empty-state">
@@ -755,6 +776,64 @@ async function renderConversationInbox(){
     });
   }catch(e){
     document.getElementById("conversationList").innerHTML = `<div class="empty-state"><h3>Couldn't load conversations.</h3></div>`;
+  }
+}
+
+function renderPendingContactRequests(){
+  const block = document.getElementById("requestsBlock");
+  if (!block) return;
+  if (!pendingContactRequests.length) { block.innerHTML = ""; return; }
+  block.innerHTML = pendingContactRequests.map(r => `
+    <div class="contact-request-card" data-id="${r.id}">
+      <div class="contact-avatar" style="background:${colorFor(r.from_id)}">${initials(r.from_username)}</div>
+      <div style="flex:1; min-width:0;">
+        <div><strong>@${escapeHtml(r.from_username)}</strong></div>
+        <div class="hint">wants to add you as a contact</div>
+      </div>
+      <div style="display:flex; gap:6px;">
+        <button class="btn-primary" data-action="accept" style="padding:6px 12px; font-size:12px;">Accept</button>
+        <button class="btn-ghost" data-action="decline" style="padding:6px 12px; font-size:12px;">Decline</button>
+      </div>
+    </div>`).join("");
+  block.querySelectorAll("[data-action]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.closest("[data-id]").dataset.id;
+      resolveContactRequestAction(id, btn.dataset.action);
+    });
+  });
+}
+
+async function resolveContactRequestAction(id, action){
+  try{
+    const res = await fetch(`/api/contact-requests/${id}/${action}`, { method: "POST", headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) { toast(data.error || "Couldn't update that request.", true); return; }
+    if (action === "accept") { toast("Contact added."); await loadContacts(); }
+    pendingContactRequests = pendingContactRequests.filter(r => String(r.id) !== String(id));
+    renderPendingContactRequests();
+    renderConversationInbox();
+  }catch(e){
+    toast("Couldn't reach the server.", true);
+  }
+}
+
+// Used from a meeting participant's profile — sends a request rather than
+// adding outright, since a meeting stranger is a different trust level
+// than someone whose exact username you typed or whose QR you scanned.
+async function sendContactRequest(toId, toUsername){
+  try{
+    const res = await fetch("/api/contact-requests", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ to_id: toId })
+    });
+    const data = await res.json();
+    if (!res.ok) { toast(data.error || "Couldn't send request.", true); return false; }
+    toast(`Request sent to @${toUsername}.`);
+    return true;
+  }catch(e){
+    toast("Couldn't reach the server.", true);
+    return false;
   }
 }
 
@@ -1933,6 +2012,7 @@ async function renderMeetingChat(){
         <span class="hint">unlocked for this session</span>
       </div>
       <div style="display:flex; gap:8px;">
+        <button class="btn-ghost" id="participantsBtn">👥 Participants</button>
         ${canManage ? `<button class="btn-ghost" id="closeMeetingBtn" style="color:var(--danger,#e5555a);">Close Meeting</button>` : ""}
         <button class="btn-ghost" id="endMeetingBtn">Leave Meeting</button>
       </div>
@@ -1952,6 +2032,7 @@ async function renderMeetingChat(){
   const input = document.getElementById("meetingInput");
   document.getElementById("meetingSendBtn").addEventListener("click", () => sendMeetingMessage(input));
   input.addEventListener("keydown", e => { if (e.key === "Enter") sendMeetingMessage(input); });
+  document.getElementById("participantsBtn").addEventListener("click", openMeetingParticipants);
   document.getElementById("endMeetingBtn").addEventListener("click", () => {
     activeMeeting = null;
     showMeetingView();
@@ -2071,6 +2152,78 @@ async function refreshCapacityStatus(){
       : `${data.participant_count} joined · no limit set`;
   }catch(e){
     el.textContent = "Couldn't load capacity.";
+  }
+}
+
+// Tapping "Participants" in a meeting shows everyone else who's in it —
+// tapping one of THEM opens a small profile with a "Send Request" action.
+async function openMeetingParticipants(){
+  const root = document.getElementById("modalRoot");
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.innerHTML = `
+    <h3>Participants</h3>
+    <div class="modal-sub">Tap someone to view their profile.</div>
+    <div id="participantsListBody" style="max-height:280px; overflow-y:auto; margin-top:8px;"><div class="hint">Loading…</div></div>
+    <div class="modal-actions"><button class="btn-ghost" id="participantsCloseBtn">Close</button></div>`;
+  backdrop.appendChild(modal);
+  root.appendChild(backdrop);
+  document.getElementById("participantsCloseBtn").addEventListener("click", () => root.removeChild(backdrop));
+
+  try{
+    const res = await fetch(`/api/meetings/${encodeURIComponent(activeMeeting.pin)}/participants`, { headers: authHeaders() });
+    const data = await res.json();
+    const body = document.getElementById("participantsListBody");
+    if (!res.ok) { body.innerHTML = `<div class="hint">${escapeHtml(data.error || "Couldn't load participants.")}</div>`; return; }
+    const participants = data.participants || [];
+    if (!participants.length) { body.innerHTML = `<div class="hint">You're the only one here so far.</div>`; return; }
+    body.innerHTML = "";
+    participants.forEach(p => {
+      const row = document.createElement("div");
+      row.className = "participant-row";
+      row.innerHTML = `
+        <div class="contact-avatar" style="background:${colorFor(p.id)}">${initials(p.username)}</div>
+        <div style="flex:1;"><strong>@${escapeHtml(p.username)}</strong></div>
+        ${p.is_contact ? `<span class="hint">Contact ✓</span>` : ""}`;
+      row.addEventListener("click", () => openParticipantProfile(p, backdrop));
+      body.appendChild(row);
+    });
+  }catch(e){
+    document.getElementById("participantsListBody").innerHTML = `<div class="hint">Couldn't reach the server.</div>`;
+  }
+}
+
+function openParticipantProfile(participant, parentBackdrop){
+  const root = document.getElementById("modalRoot");
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.innerHTML = `
+    <div style="display:flex; justify-content:center; margin-bottom:10px;">
+      <div class="contact-avatar" style="width:64px; height:64px; font-size:20px; background:${colorFor(participant.id)}">${initials(participant.username)}</div>
+    </div>
+    <h3 style="text-align:center;">@${escapeHtml(participant.username)}</h3>
+    <div class="modal-sub" style="text-align:center;">${participant.is_contact ? "Already in your contacts." : "Not in your contacts yet."}</div>
+    <div class="modal-actions" style="justify-content:center;">
+      ${participant.is_contact
+        ? `<button class="btn-ghost" id="profileCloseBtn">Close</button>`
+        : `<button class="btn-ghost" id="profileCloseBtn">Cancel</button><button class="btn-primary" id="sendRequestBtn">Send Contact Request</button>`}
+    </div>`;
+  backdrop.appendChild(modal);
+  root.appendChild(backdrop);
+  document.getElementById("profileCloseBtn").addEventListener("click", () => root.removeChild(backdrop));
+  const sendBtn = document.getElementById("sendRequestBtn");
+  if (sendBtn) {
+    sendBtn.addEventListener("click", async () => {
+      sendBtn.disabled = true;
+      sendBtn.textContent = "Sending…";
+      const ok = await sendContactRequest(participant.id, participant.username);
+      if (ok) root.removeChild(backdrop);
+      else { sendBtn.disabled = false; sendBtn.textContent = "Send Contact Request"; }
+    });
   }
 }
 
