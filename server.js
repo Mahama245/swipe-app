@@ -24,7 +24,7 @@ const ORIGIN = process.env.ORIGIN || `http://localhost:${PORT}`;
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "20mb" })); // raised from 8mb to fit small video/file attachments as base64
 app.use(express.static(path.join(__dirname, "public")));
 
 const server = http.createServer(app);
@@ -107,12 +107,19 @@ app.post("/api/login", safe(async (req, res) => {
   if (user.status === "suspended") return res.status(403).json({ error: "This account is suspended.", suspended: true });
   await db.ensureBootstrapAdmin(user.username);
   const fresh = await db.getUserByUsername(clean); // re-read in case bootstrap just changed is_admin
-  res.json({ token: issueToken(fresh), username: fresh.username, is_admin: !!fresh.is_admin });
+  res.json({ token: issueToken(fresh), username: fresh.username, is_admin: !!fresh.is_admin, avatar: fresh.avatar || null });
 }));
 
 app.get("/api/me", authMiddleware, safe(async (req, res) => {
   const user = await db.getUserById(req.userId);
-  res.json({ id: req.userId, username: req.username, is_admin: !!(user && user.is_admin) });
+  const pendingUsernameRequest = await db.getPendingUsernameRequestForUser(req.userId);
+  res.json({
+    id: req.userId,
+    username: req.username,
+    is_admin: !!(user && user.is_admin),
+    avatar: (user && user.avatar) || null,
+    pending_username_request: pendingUsernameRequest ? pendingUsernameRequest.requested_username : null
+  });
 }));
 
 // ---------------------------------------------------------------------------
@@ -220,7 +227,7 @@ app.post("/api/webauthn/login-verify", safe(async (req, res) => {
   if (user.status === "banned") return res.status(403).json({ error: "This account has been banned.", banned: true });
   if (user.status === "suspended") return res.status(403).json({ error: "This account is suspended.", suspended: true });
 
-  res.json({ token: issueToken(user), username: user.username, is_admin: !!user.is_admin });
+  res.json({ token: issueToken(user), username: user.username, is_admin: !!user.is_admin, avatar: user.avatar || null });
 }));
 
 app.get("/api/webauthn/devices", authMiddleware, safe(async (req, res) => {
@@ -234,8 +241,56 @@ app.delete("/api/webauthn/devices/:credentialId", authMiddleware, safe(async (re
 }));
 
 // ---------------------------------------------------------------------------
-// CONTACTS
+// SELF-SERVICE ACCOUNT — avatar, password change, username change request
 // ---------------------------------------------------------------------------
+
+// Rough sanity cap on avatar size — the client resizes images before
+// uploading, so a legitimate avatar should never get near this.
+const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
+
+app.patch("/api/me/avatar", authMiddleware, safe(async (req, res) => {
+  const { avatar } = req.body || {};
+  if (avatar !== null && (typeof avatar !== "string" || !avatar.startsWith("data:image/"))) {
+    return res.status(400).json({ error: "Avatar must be an image, or null to remove it." });
+  }
+  if (avatar && avatar.length > MAX_AVATAR_BYTES) {
+    return res.status(400).json({ error: "That image is too large. Try a smaller photo." });
+  }
+  const updated = await db.setUserAvatar(req.userId, avatar);
+  res.json({ ok: true, avatar: updated.avatar });
+}));
+
+app.post("/api/me/change-password", authMiddleware, safe(async (req, res) => {
+  const { current_password, new_password } = req.body || {};
+  if (!new_password || new_password.length < 4) {
+    return res.status(400).json({ error: "New password must be at least 4 characters." });
+  }
+  const user = await db.getUserById(req.userId);
+  if (!user || !bcrypt.compareSync(current_password || "", user.password_hash)) {
+    return res.status(401).json({ error: "Current password is incorrect." });
+  }
+  const hash = bcrypt.hashSync(new_password, 10);
+  await db.setUserPasswordHash(req.userId, hash);
+  res.json({ ok: true });
+}));
+
+app.post("/api/me/username-request", authMiddleware, safe(async (req, res) => {
+  const { requested_username } = req.body || {};
+  const clean = (requested_username || "").trim().toLowerCase();
+  if (clean.length < 3) return res.status(400).json({ error: "Username must be at least 3 characters." });
+  if (clean === req.username) return res.status(400).json({ error: "That's already your username." });
+  const result = await db.createUsernameChangeRequest(req.userId, req.username, clean);
+  if (result.error === "already_pending") return res.status(409).json({ error: "You already have a username change request pending approval." });
+  if (result.error === "taken") return res.status(409).json({ error: "That username is already taken." });
+  res.json({ request: result.request });
+}));
+
+app.get("/api/me/username-request", authMiddleware, safe(async (req, res) => {
+  const request = await db.getPendingUsernameRequestForUser(req.userId);
+  res.json({ request });
+}));
+
+
 app.get("/api/contacts", authMiddleware, safe(async (req, res) => {
   res.json({ contacts: await db.getContacts(req.userId) });
 }));
@@ -270,21 +325,52 @@ app.get("/api/messages/:username", authMiddleware, safe(async (req, res) => {
     kind: r.kind,
     numbers: r.numbers || null,
     image: r.image || null,
+    file_data: r.file_data || null,
+    file_name: r.file_name || null,
+    file_type: r.file_type || null,
+    shared_username: r.shared_username || null,
     created_at: r.created_at
   }));
   res.json({ messages: out });
 }));
 
 app.post("/api/messages", authMiddleware, safe(async (req, res) => {
-  const { to, numbers, kind, image } = req.body || {};
+  const { to, numbers, kind, image, file_data, file_name, file_type, shared_username } = req.body || {};
   const other = await db.getUserByUsername((to || "").trim().toLowerCase());
   if (!other) return res.status(404).json({ error: "Recipient not found." });
-  const msgKind = kind === "image" ? "image" : "text";
+
+  const validKinds = ["text", "image", "video", "file", "contact"];
+  const msgKind = validKinds.includes(kind) ? kind : "text";
   if (msgKind === "text" && (!Array.isArray(numbers) || numbers.length === 0)) {
     return res.status(400).json({ error: "Encoded numbers required." });
   }
+  if (msgKind === "image" && !image) {
+    return res.status(400).json({ error: "Image data required." });
+  }
+  if ((msgKind === "video" || msgKind === "file") && (!file_data || !file_name)) {
+    return res.status(400).json({ error: "File data and file name required." });
+  }
+  // MongoDB rejects any document over 16MB outright — this is the real
+  // backstop (the client-side check is just a faster, friendlier version
+  // of the same limit).
+  if ((msgKind === "video" || msgKind === "file" || msgKind === "image")) {
+    const payloadSize = (file_data || image || "").length;
+    if (payloadSize > 11 * 1024 * 1024) {
+      return res.status(413).json({ error: "That attachment is too large. Try a smaller file (max ~8MB)." });
+    }
+  }
+  let sharedTarget = null;
+  if (msgKind === "contact") {
+    const cleanShared = (shared_username || "").trim().toLowerCase();
+    sharedTarget = await db.getUserByUsername(cleanShared);
+    if (!sharedTarget) return res.status(404).json({ error: "That contact doesn't exist." });
+  }
 
-  const saved = await db.insertMessage({ sender_id: req.userId, receiver_id: other.id, kind: msgKind, numbers, image });
+  const saved = await db.insertMessage({
+    sender_id: req.userId, receiver_id: other.id, kind: msgKind,
+    numbers, image, file_data, file_name, file_type,
+    shared_username: sharedTarget ? sharedTarget.username : null
+  });
 
   const payload = {
     id: saved.id,
@@ -292,6 +378,10 @@ app.post("/api/messages", authMiddleware, safe(async (req, res) => {
     kind: msgKind,
     numbers: numbers || null,
     image: image || null,
+    file_data: file_data || null,
+    file_name: file_name || null,
+    file_type: file_type || null,
+    shared_username: sharedTarget ? sharedTarget.username : null,
     created_at: saved.created_at
   };
 
@@ -562,6 +652,30 @@ app.post("/api/admin/users/:id/reset-password", authMiddleware, requireAdmin, sa
 app.get("/api/admin/audit-log", authMiddleware, requireAdmin, safe(async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, 500);
   res.json({ entries: await db.getAdminAuditLog(limit) });
+}));
+
+// ---------------------------------------------------------------------------
+// ADMIN — username change requests
+// ---------------------------------------------------------------------------
+app.get("/api/admin/username-requests", authMiddleware, requireAdmin, safe(async (req, res) => {
+  res.json({ requests: await db.getPendingUsernameRequests() });
+}));
+
+app.post("/api/admin/username-requests/:id/approve", authMiddleware, requireAdmin, safe(async (req, res) => {
+  const result = await db.resolveUsernameRequest(Number(req.params.id), true, req.userId);
+  if (!result) return res.status(404).json({ error: "Request not found." });
+  if (result.error === "taken") return res.status(409).json({ error: "That username was taken in the meantime. Request denied." });
+  await logAdmin(req, "approve_username_change", "user", result.request.user_id, result.request.current_username,
+    `${result.request.current_username} -> ${result.request.requested_username}`);
+  res.json({ request: result.request });
+}));
+
+app.post("/api/admin/username-requests/:id/deny", authMiddleware, requireAdmin, safe(async (req, res) => {
+  const result = await db.resolveUsernameRequest(Number(req.params.id), false, req.userId);
+  if (!result) return res.status(404).json({ error: "Request not found." });
+  await logAdmin(req, "deny_username_change", "user", result.request.user_id, result.request.current_username,
+    `requested ${result.request.requested_username}`);
+  res.json({ request: result.request });
 }));
 
 // ---------------------------------------------------------------------------

@@ -45,6 +45,7 @@ const UserSchema = new mongoose.Schema({
   // login AND on every authenticated request thereafter (see server.js),
   // so kicking someone takes effect immediately even mid-session.
   status: { type: String, enum: ["active", "suspended", "banned"], default: "active" },
+  avatar: { type: String, default: null }, // data URL, resized client-side before upload
   created_at: { type: Date, default: Date.now }
 });
 const User = mongoose.model("User", UserSchema);
@@ -60,9 +61,15 @@ const MessageSchema = new mongoose.Schema({
   id: { type: Number, unique: true },
   sender_id: Number,
   receiver_id: Number,
-  kind: String,
+  kind: String, // "text" | "image" | "video" | "file" | "contact"
   numbers: mongoose.Schema.Types.Mixed,
   image: String,
+  // video/file share a generic payload shape rather than one field per kind
+  file_data: String, // data URL
+  file_name: String,
+  file_type: String, // mime type
+  // "contact" kind — a shared contact card, added by tapping in the chat
+  shared_username: String,
   created_at: { type: Date, default: Date.now }
 });
 const Message = mongoose.model("Message", MessageSchema);
@@ -111,6 +118,20 @@ const MeetingAccessRequestSchema = new mongoose.Schema({
   resolved_by: { type: Number, default: null }
 });
 const MeetingAccessRequest = mongoose.model("MeetingAccessRequest", MeetingAccessRequestSchema);
+
+// A user asks to change their username; nothing changes until an admin
+// approves it. One pending request per user at a time.
+const UsernameChangeRequestSchema = new mongoose.Schema({
+  id: { type: Number, unique: true },
+  user_id: Number,
+  current_username: String,
+  requested_username: String,
+  status: { type: String, enum: ["PENDING", "APPROVED", "DENIED"], default: "PENDING" },
+  created_at: { type: Date, default: Date.now },
+  resolved_at: { type: Date, default: null },
+  resolved_by: { type: Number, default: null }
+});
+const UsernameChangeRequest = mongoose.model("UsernameChangeRequest", UsernameChangeRequestSchema);
 
 const MeetingMessageSchema = new mongoose.Schema({
   id: { type: Number, unique: true },
@@ -232,6 +253,51 @@ async function setUserPasswordHash(userId, password_hash) {
   const user = await User.findOneAndUpdate({ id: userId }, { password_hash }, { new: true });
   return user ? user.toObject() : null;
 }
+async function setUserAvatar(userId, avatar) {
+  const user = await User.findOneAndUpdate({ id: userId }, { avatar: avatar || null }, { new: true });
+  return user ? user.toObject() : null;
+}
+
+// ---------------------------------------------------------------------------
+// USERNAME CHANGE REQUESTS (self-service, admin-approved)
+// ---------------------------------------------------------------------------
+async function createUsernameChangeRequest(user_id, current_username, requested_username) {
+  const existingPending = await UsernameChangeRequest.findOne({ user_id, status: "PENDING" });
+  if (existingPending) return { error: "already_pending" };
+  if (await getUserByUsername(requested_username)) return { error: "taken" };
+  const id = await nextId("username_change_request");
+  const request = await UsernameChangeRequest.create({ id, user_id, current_username, requested_username });
+  return { request: request.toObject() };
+}
+async function getPendingUsernameRequestForUser(user_id) {
+  return UsernameChangeRequest.findOne({ user_id, status: "PENDING" }).lean();
+}
+async function getPendingUsernameRequests() {
+  return UsernameChangeRequest.find({ status: "PENDING" }).sort({ created_at: -1 }).lean();
+}
+// On approval, renames the account. Historical strings recorded elsewhere
+// (past meeting participant lists, old audit log entries) intentionally
+// keep the old username — they're a record of what happened at the time,
+// not a live reference — only the live User doc is renamed.
+async function resolveUsernameRequest(id, approve, resolved_by) {
+  const request = await UsernameChangeRequest.findOne({ id });
+  if (!request) return null;
+  if (approve) {
+    if (await getUserByUsername(request.requested_username)) {
+      request.status = "DENIED";
+      request.resolved_at = new Date();
+      request.resolved_by = resolved_by;
+      await request.save();
+      return { request: request.toObject(), error: "taken" };
+    }
+    await User.updateOne({ id: request.user_id }, { username: request.requested_username });
+  }
+  request.status = approve ? "APPROVED" : "DENIED";
+  request.resolved_at = new Date();
+  request.resolved_by = resolved_by;
+  await request.save();
+  return { request: request.toObject() };
+}
 
 // ---------------------------------------------------------------------------
 // ADMIN AUDIT LOG
@@ -279,12 +345,16 @@ async function getMessagesBetween(idA, idB) {
     ]
   }).sort({ id: 1 }).lean();
 }
-async function insertMessage({ sender_id, receiver_id, kind, numbers, image }) {
+async function insertMessage({ sender_id, receiver_id, kind, numbers, image, file_data, file_name, file_type, shared_username }) {
   const id = await nextId("message");
   const msg = await Message.create({
     id, sender_id, receiver_id, kind,
     numbers: numbers || null,
-    image: image || null
+    image: image || null,
+    file_data: file_data || null,
+    file_name: file_name || null,
+    file_type: file_type || null,
+    shared_username: shared_username || null
   });
   return msg.toObject();
 }
@@ -444,7 +514,8 @@ async function deleteAuthenticator(user_id, credential_id) {
 
 module.exports = {
   getUserByUsername, getUserById, createUser, ensureBootstrapAdmin, isBootstrapAdminUsername,
-  listUsers, setUserStatus, deleteUserAccount, setUserPasswordHash,
+  listUsers, setUserStatus, deleteUserAccount, setUserPasswordHash, setUserAvatar,
+  createUsernameChangeRequest, getPendingUsernameRequestForUser, getPendingUsernameRequests, resolveUsernameRequest,
   logAdminAction, getAdminAuditLog,
   addContactPair, getContacts,
   getMessagesBetween, insertMessage,
