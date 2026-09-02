@@ -345,6 +345,40 @@ async function getMessagesBetween(idA, idB) {
     ]
   }).sort({ id: 1 }).lean();
 }
+
+// Everyone this user has EVER exchanged a message with — contact or not.
+// Contacts are a curated address book; this is the actual message inbox,
+// so a message from someone you haven't added yet still shows up here.
+async function getConversations(userId) {
+  const rows = await Message.find({ $or: [{ sender_id: userId }, { receiver_id: userId }] })
+    .sort({ id: -1 })
+    .lean();
+  const byOtherId = new Map();
+  for (const r of rows) {
+    const otherId = r.sender_id === userId ? r.receiver_id : r.sender_id;
+    if (!byOtherId.has(otherId)) byOtherId.set(otherId, r); // rows are newest-first, so first hit = most recent
+  }
+  const contactRows = await Contact.find({ user_id: userId }).lean();
+  const contactIds = new Set(contactRows.map(c => c.contact_id));
+  const results = await Promise.all([...byOtherId.entries()].map(async ([otherId, lastMsg]) => {
+    const user = await getUserById(otherId);
+    if (!user) return null;
+    return {
+      id: user.id,
+      username: user.username,
+      is_contact: contactIds.has(otherId),
+      last_message: {
+        kind: lastMsg.kind,
+        from_me: lastMsg.sender_id === userId,
+        file_name: lastMsg.file_name || null,
+        shared_username: lastMsg.shared_username || null,
+        created_at: lastMsg.created_at
+      }
+    };
+  }));
+  return results.filter(Boolean).sort((a, b) => new Date(b.last_message.created_at) - new Date(a.last_message.created_at));
+}
+
 async function insertMessage({ sender_id, receiver_id, kind, numbers, image, file_data, file_name, file_type, shared_username }) {
   const id = await nextId("message");
   const msg = await Message.create({
@@ -517,7 +551,7 @@ module.exports = {
   listUsers, setUserStatus, deleteUserAccount, setUserPasswordHash, setUserAvatar,
   createUsernameChangeRequest, getPendingUsernameRequestForUser, getPendingUsernameRequests, resolveUsernameRequest,
   logAdminAction, getAdminAuditLog,
-  addContactPair, getContacts,
+  addContactPair, getContacts, getConversations,
   getMessagesBetween, insertMessage,
   getStatuses, insertStatus,
   getMeeting, createMeeting, closeMeeting, canAccessMeeting, getMeetingMessages, insertMeetingMessage,
