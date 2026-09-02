@@ -302,6 +302,46 @@ app.get("/api/conversations", authMiddleware, safe(async (req, res) => {
   res.json({ conversations: await db.getConversations(req.userId) });
 }));
 
+// ---------------------------------------------------------------------------
+// CONTACT REQUESTS — tap a participant's profile in a meeting to send one;
+// they only become contacts once the recipient accepts.
+// ---------------------------------------------------------------------------
+app.post("/api/contact-requests", authMiddleware, safe(async (req, res) => {
+  const { to_id } = req.body || {};
+  const toId = Number(to_id);
+  if (!Number.isInteger(toId)) return res.status(400).json({ error: "Recipient required." });
+  const target = await db.getUserById(toId);
+  if (!target) return res.status(404).json({ error: "User not found." });
+  const result = await db.createContactRequest(req.userId, toId);
+  if (result.error === "self") return res.status(400).json({ error: "You can't send yourself a request." });
+  if (result.error === "already_contacts") return res.status(409).json({ error: "You're already contacts." });
+  if (result.error === "already_pending") return res.status(409).json({ error: "There's already a pending request between you two." });
+  // Live-notify the recipient if they're online right now.
+  io.to(`user:${toId}`).emit("contact-request:new", { id: result.request.id, from_id: req.userId, from_username: req.username, created_at: result.request.created_at });
+  res.json({ request: result.request });
+}));
+
+app.get("/api/contact-requests", authMiddleware, safe(async (req, res) => {
+  res.json({ requests: await db.getPendingContactRequestsFor(req.userId) });
+}));
+
+app.post("/api/contact-requests/:id/accept", authMiddleware, safe(async (req, res) => {
+  const result = await db.resolveContactRequest(Number(req.params.id), req.userId, true);
+  if (result.error === "not_found") return res.status(404).json({ error: "Request not found." });
+  if (result.error === "not_yours") return res.status(403).json({ error: "That's not your request to resolve." });
+  if (result.error === "already_resolved") return res.status(409).json({ error: "That request was already handled." });
+  io.to(`user:${result.request.from_id}`).emit("contact-request:accepted", { by_id: req.userId, by_username: req.username });
+  res.json({ ok: true });
+}));
+
+app.post("/api/contact-requests/:id/decline", authMiddleware, safe(async (req, res) => {
+  const result = await db.resolveContactRequest(Number(req.params.id), req.userId, false);
+  if (result.error === "not_found") return res.status(404).json({ error: "Request not found." });
+  if (result.error === "not_yours") return res.status(403).json({ error: "That's not your request to resolve." });
+  if (result.error === "already_resolved") return res.status(409).json({ error: "That request was already handled." });
+  res.json({ ok: true });
+}));
+
 app.post("/api/contacts", authMiddleware, safe(async (req, res) => {
   const { username } = req.body || {};
   const clean = (username || "").trim().toLowerCase();
@@ -529,6 +569,23 @@ app.get("/api/meetings/:pin/messages", authMiddleware, safe(async (req, res) => 
   const allowed = await db.canAccessMeeting(meeting, req.username, !!(me && me.is_admin));
   if (!allowed) return res.status(403).json({ error: "This meeting has been closed.", closed: true });
   res.json({ messages: await db.getMeetingMessages(req.params.pin) });
+}));
+
+// Lets the client render tappable profiles for "who's in this meeting" —
+// each participant, minus you, with enough info to send a contact request.
+app.get("/api/meetings/:pin/participants", authMiddleware, safe(async (req, res) => {
+  const meeting = await db.getMeeting(req.params.pin);
+  if (!meeting) return res.status(404).json({ error: "No meeting with that PIN." });
+  const me = await db.getUserById(req.userId);
+  const allowed = await db.canAccessMeeting(meeting, req.username, !!(me && me.is_admin));
+  if (!allowed) return res.status(403).json({ error: "This meeting has been closed.", closed: true });
+  const all = await db.getMeetingParticipants(req.params.pin);
+  const myContacts = await db.getContacts(req.userId);
+  const contactIds = new Set(myContacts.map(c => c.id));
+  const participants = all
+    .filter(p => p.id !== req.userId)
+    .map(p => ({ id: p.id, username: p.username, is_contact: contactIds.has(p.id) }));
+  res.json({ participants });
 }));
 
 app.post("/api/meetings/:pin/messages", authMiddleware, safe(async (req, res) => {
