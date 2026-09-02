@@ -111,6 +111,11 @@ app.post("/api/login", safe(async (req, res) => {
 }));
 
 app.get("/api/me", authMiddleware, safe(async (req, res) => {
+  // Self-healing: if this is the bootstrap admin username but the flag
+  // somehow isn't set (e.g. the account has only ever used biometric
+  // login before that path also checked this), fix it on the spot rather
+  // than requiring a fresh password login.
+  await db.ensureBootstrapAdmin(req.username);
   const user = await db.getUserById(req.userId);
   const pendingUsernameRequest = await db.getPendingUsernameRequestForUser(req.userId);
   res.json({
@@ -227,7 +232,13 @@ app.post("/api/webauthn/login-verify", safe(async (req, res) => {
   if (user.status === "banned") return res.status(403).json({ error: "This account has been banned.", banned: true });
   if (user.status === "suspended") return res.status(403).json({ error: "This account is suspended.", suspended: true });
 
-  res.json({ token: issueToken(user), username: user.username, is_admin: !!user.is_admin, avatar: user.avatar || null });
+  // This was previously only checked on password login, so an account that
+  // only ever signs in via Face ID/fingerprint could stay stuck without
+  // admin rights forever, even as the designated bootstrap admin.
+  await db.ensureBootstrapAdmin(user.username);
+  const fresh = await db.getUserById(user.id);
+
+  res.json({ token: issueToken(fresh), username: fresh.username, is_admin: !!fresh.is_admin, avatar: fresh.avatar || null });
 }));
 
 app.get("/api/webauthn/devices", authMiddleware, safe(async (req, res) => {
