@@ -159,6 +159,20 @@ const AdminAuditLogSchema = new mongoose.Schema({
 });
 const AdminAuditLog = mongoose.model("AdminAuditLog", AdminAuditLogSchema);
 
+// Tapping a participant's profile in a meeting sends one of these instead
+// of adding them outright — a stranger from a meeting is a different trust
+// level than someone whose exact username you typed or whose QR you
+// scanned, so this path always needs the other person's consent.
+const ContactRequestSchema = new mongoose.Schema({
+  id: { type: Number, unique: true },
+  from_id: Number,
+  to_id: Number,
+  status: { type: String, enum: ["PENDING", "ACCEPTED", "DECLINED"], default: "PENDING" },
+  created_at: { type: Date, default: Date.now },
+  resolved_at: { type: Date, default: null }
+});
+const ContactRequest = mongoose.model("ContactRequest", ContactRequestSchema);
+
 // WebAuthn credentials (Face ID / fingerprint / Windows Hello).
 // The server NEVER sees biometric data — only a public key + counter.
 const AuthenticatorSchema = new mongoose.Schema({
@@ -325,6 +339,9 @@ async function addContactPair(userId, contactId) {
   const exists2 = await Contact.findOne({ user_id: contactId, contact_id: userId });
   if (!exists2) await Contact.create({ user_id: contactId, contact_id: userId });
 }
+async function areContacts(userId, otherId) {
+  return !!(await Contact.findOne({ user_id: userId, contact_id: otherId }));
+}
 async function getContacts(userId) {
   const rows = await Contact.find({ user_id: userId }).lean();
   const users = await Promise.all(rows.map(c => getUserById(c.contact_id)));
@@ -332,6 +349,41 @@ async function getContacts(userId) {
     .filter(Boolean)
     .map(u => ({ id: u.id, username: u.username }))
     .sort((a, b) => a.username.localeCompare(b.username));
+}
+
+// ---------------------------------------------------------------------------
+// CONTACT REQUESTS (tap-a-participant-in-a-meeting flow)
+// ---------------------------------------------------------------------------
+async function createContactRequest(fromId, toId) {
+  if (fromId === toId) return { error: "self" };
+  if (await areContacts(fromId, toId)) return { error: "already_contacts" };
+  const existing = await ContactRequest.findOne({
+    status: "PENDING",
+    $or: [{ from_id: fromId, to_id: toId }, { from_id: toId, to_id: fromId }]
+  });
+  if (existing) return { error: "already_pending" };
+  const id = await nextId("contact_request");
+  const request = await ContactRequest.create({ id, from_id: fromId, to_id: toId });
+  return { request: request.toObject() };
+}
+async function getPendingContactRequestsFor(userId) {
+  const rows = await ContactRequest.find({ to_id: userId, status: "PENDING" }).sort({ created_at: -1 }).lean();
+  const withUsernames = await Promise.all(rows.map(async r => {
+    const from = await getUserById(r.from_id);
+    return from ? { id: r.id, from_id: r.from_id, from_username: from.username, created_at: r.created_at } : null;
+  }));
+  return withUsernames.filter(Boolean);
+}
+async function resolveContactRequest(id, userId, accept) {
+  const request = await ContactRequest.findOne({ id });
+  if (!request) return { error: "not_found" };
+  if (request.to_id !== userId) return { error: "not_yours" };
+  if (request.status !== "PENDING") return { error: "already_resolved" };
+  request.status = accept ? "ACCEPTED" : "DECLINED";
+  request.resolved_at = new Date();
+  await request.save();
+  if (accept) await addContactPair(request.from_id, request.to_id);
+  return { request: request.toObject() };
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +509,15 @@ async function joinAsParticipant(pin, username) {
   await meeting.save();
   return { ok: true };
 }
+// Resolves the meeting's participant usernames to {id, username} pairs,
+// so the client can render tappable profiles (and know each other's user
+// id for sending a contact request).
+async function getMeetingParticipants(pin) {
+  const meeting = await Meeting.findOne({ pin }).lean();
+  if (!meeting) return [];
+  const users = await Promise.all((meeting.participants || []).map(u => getUserByUsername(u)));
+  return users.filter(Boolean).map(u => ({ id: u.id, username: u.username }));
+}
 async function setMeetingCapacity(pin, max_participants) {
   const meeting = await Meeting.findOneAndUpdate({ pin }, { max_participants }, { new: true });
   return meeting ? meeting.toObject() : null;
@@ -551,11 +612,12 @@ module.exports = {
   listUsers, setUserStatus, deleteUserAccount, setUserPasswordHash, setUserAvatar,
   createUsernameChangeRequest, getPendingUsernameRequestForUser, getPendingUsernameRequests, resolveUsernameRequest,
   logAdminAction, getAdminAuditLog,
-  addContactPair, getContacts, getConversations,
+  addContactPair, getContacts, getConversations, areContacts,
+  createContactRequest, getPendingContactRequestsFor, resolveContactRequest,
   getMessagesBetween, insertMessage,
   getStatuses, insertStatus,
   getMeeting, createMeeting, closeMeeting, canAccessMeeting, getMeetingMessages, insertMeetingMessage,
-  joinAsParticipant, setMeetingCapacity, resetMeetingCapacity, reopenMeetingForAllParticipants,
+  joinAsParticipant, setMeetingCapacity, resetMeetingCapacity, reopenMeetingForAllParticipants, getMeetingParticipants,
   createAccessRequest, getPendingAccessRequests, resolveAccessRequest,
   saveChallenge, getChallenge, clearChallenge,
   addAuthenticator, getAuthenticatorsByUser, getAuthenticatorByCredentialId,
