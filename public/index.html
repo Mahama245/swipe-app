@@ -334,15 +334,11 @@ function enterApp(){
 
   socket = io({ auth: { token } });
   socket.on("chat:message", ({ message }) => {
-    const contact = getContact(currentContactId);
-    if (contact && (message.from === contact.username || message.from === "You" && false)){
-      // message is for the currently-open chat if it involves the open contact
-    }
-    if (contact && currentView === "chats" && (message.from === contact.username)){
+    const contact = getChatPartner(currentContactId);
+    if (currentView === "chats" && contact && message.from_id === contact.id) {
       appendLiveMessage(message);
-    }
-    if (contact && currentView === "chats"){
-      // also refresh unread indicator could go here
+    } else if (currentView === "chats" && !contact) {
+      renderConversationInbox(); // update the inbox preview/order for the new message
     }
   });
   socket.on("status:new", (s) => {
@@ -494,6 +490,7 @@ function formatNumbers(numbers){
 // STATE
 // =====================================================================
 let contacts = [];              // { id, username }
+let conversations = [];         // { id, username, is_contact, last_message } — everyone you've exchanged a message with
 let currentContactId = null;
 let currentView = "chats";
 let activeMeeting = null;       // { pin, formula }
@@ -503,6 +500,9 @@ const AVATAR_COLORS = ["#B98CFF", "#7FE0C4", "#F2A65A", "#8FA6E8", "#E89CC7", "#
 function colorFor(id){ return AVATAR_COLORS[id % AVATAR_COLORS.length]; }
 function initials(name){ return name.split(" ").map(w => w[0]).slice(0,2).join("").toUpperCase(); }
 function getContact(id){ return contacts.find(c => c.id === id); }
+// Looks in both the curated contacts list AND the wider conversation inbox,
+// so a chat with someone you haven't added yet can still be opened.
+function getChatPartner(id){ return contacts.find(c => c.id === id) || conversations.find(c => c.id === id); }
 
 // =====================================================================
 // TOAST
@@ -699,13 +699,63 @@ function setActiveNav(view){
 // =====================================================================
 function showChatsView(){
   currentView = "chats";
-  const contact = getContact(currentContactId);
+  const contact = getChatPartner(currentContactId);
   if (contact){ renderChatView(contact); return; }
+  renderConversationInbox();
+}
+
+function conversationPreviewText(c){
+  const lm = c.last_message;
+  if (!lm) return "";
+  const prefix = lm.from_me ? "You: " : "";
+  if (lm.kind === "text") return prefix + "🔢 Encoded message";
+  if (lm.kind === "image") return prefix + "📷 Photo";
+  if (lm.kind === "video") return prefix + "🎬 Video";
+  if (lm.kind === "file") return prefix + "📄 " + (lm.file_name || "File");
+  if (lm.kind === "contact") return prefix + "👤 Shared @" + (lm.shared_username || "contact");
+  return prefix + "New message";
+}
+
+async function renderConversationInbox(){
   const main = document.getElementById("main");
-  main.innerHTML = `<div class="empty-state">
-    <h3>Select a contact</h3>
-    <div>Pick someone from the list to start an encoded conversation.</div>
-  </div>`;
+  main.innerHTML = `<div class="view-header"><h2>💬 Chats</h2></div>
+    <div id="conversationList" style="padding:16px;"><div class="empty-state"><h3>Loading…</h3></div></div>`;
+  try{
+    const res = await fetch("/api/conversations", { headers: authHeaders() });
+    const data = await res.json();
+    conversations = data.conversations || [];
+    const list = document.getElementById("conversationList");
+    if (!conversations.length){
+      list.innerHTML = `<div class="empty-state">
+        <h3>No conversations yet</h3>
+        <div>Add a contact, or wait for someone to message you first — you'll see it here either way.</div>
+      </div>`;
+      return;
+    }
+    list.innerHTML = "";
+    conversations.forEach(c => {
+      const row = document.createElement("div");
+      row.className = "contact-item";
+      row.style.cssText = "padding:12px 14px; border:1px solid var(--border); border-radius:10px; margin-bottom:8px; cursor:pointer;";
+      row.innerHTML = `
+        <div class="contact-avatar" style="background:${colorFor(c.id)}">${initials(c.username)}</div>
+        <div style="flex:1; min-width:0;">
+          <div style="display:flex; align-items:center; gap:6px;">
+            <span style="font-weight:600;">@${escapeHtml(c.username)}</span>
+            ${!c.is_contact ? `<span class="status-pill" style="color:var(--accent); background:var(--accent-dim); border:1px solid var(--accent);">new</span>` : ""}
+          </div>
+          <div class="hint" style="margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(conversationPreviewText(c))}</div>
+        </div>`;
+      row.addEventListener("click", () => {
+        currentContactId = c.id;
+        renderContactList();
+        renderChatView(c);
+      });
+      list.appendChild(row);
+    });
+  }catch(e){
+    document.getElementById("conversationList").innerHTML = `<div class="empty-state"><h3>Couldn't load conversations.</h3></div>`;
+  }
 }
 
 function showStatusView(){
@@ -1161,7 +1211,6 @@ document.getElementById("addContactBtn").addEventListener("click", () => {
         });
         const data = await res.json();
         if (!res.ok) return { error: data.error || "Couldn't add contact." };
-        if (socket) socket.emit("contact:added", data.contact.id);
         await loadContacts();
         toast(`Added @${data.contact.username}.`);
       }catch(e){
@@ -1184,7 +1233,6 @@ async function addContactByUsername(username){
     });
     const data = await res.json();
     if (!res.ok) return { error: data.error || "Couldn't add contact." };
-    if (socket) socket.emit("contact:added", data.contact.id);
     await loadContacts();
     return { contact: data.contact };
   }catch(e){
@@ -1459,10 +1507,13 @@ function openQrScanner(){
 
 async function renderChatView(contact){
   const main = document.getElementById("main");
+  const isContact = contacts.some(c => c.id === contact.id);
   main.innerHTML = `
     <div class="view-header">
       <h2>@${contact.username}</h2>
-      <span class="hint">tap a message to decode it</span>
+      ${isContact
+        ? `<span class="hint">tap a message to decode it</span>`
+        : `<button class="btn-ghost" id="addFromChatBtn" style="color:var(--accent);">+ Add contact</button>`}
     </div>
     <div class="chat-scroll" id="chatScroll"><div class="empty-state"><h3>Loading…</h3></div></div>
     <div class="compose">
@@ -1475,6 +1526,15 @@ async function renderChatView(contact){
   document.getElementById("sendBtn").addEventListener("click", () => sendText(contact, input));
   input.addEventListener("keydown", e => { if (e.key === "Enter") sendText(contact, input); });
   document.getElementById("attachBtn").addEventListener("click", () => openAttachMenu(contact));
+  const addBtn = document.getElementById("addFromChatBtn");
+  if (addBtn) {
+    addBtn.addEventListener("click", async () => {
+      const result = await addContactByUsername(contact.username);
+      if (result.error) { toast(result.error, true); return; }
+      toast(`Added @${contact.username}.`);
+      renderChatView(contact); // re-render header without the Add button
+    });
+  }
 
   try{
     const res = await fetch(`/api/messages/${encodeURIComponent(contact.username)}`, { headers: authHeaders() });
