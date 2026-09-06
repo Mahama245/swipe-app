@@ -80,6 +80,28 @@ function issueToken(user) {
   return jwt.sign({ uid: user.id, username: user.username }, JWT_SECRET, { expiresIn: "30d" });
 }
 
+// Pings every current admin live (if they're online) — used so admins hear
+// about meeting activity as it happens instead of only when they happen to
+// open the admin panel.
+async function notifyAdmins(event, payload) {
+  const admins = await db.getAdminUsers();
+  admins.forEach(a => io.to(`user:${a.id}`).emit(event, payload));
+}
+
+// Who should receive a live push for one of a user's statuses: their
+// contacts, themself, and anyone specifically @mentioned (even if not a
+// contact) — the same set that's allowed to see it at all.
+async function statusAudienceUserIds(posterId, mentionedUsernames) {
+  const contacts = await db.getContacts(posterId);
+  const ids = new Set(contacts.map(c => c.id));
+  ids.add(posterId);
+  for (const uname of mentionedUsernames || []) {
+    const u = await db.getUserByUsername(uname);
+    if (u) ids.add(u.id);
+  }
+  return [...ids];
+}
+
 // ---------------------------------------------------------------------------
 // PASSWORD AUTH
 // ---------------------------------------------------------------------------
@@ -109,6 +131,13 @@ app.post("/api/login", safe(async (req, res) => {
   await db.ensureBootstrapAdmin(user.username);
   const fresh = await db.getUserByUsername(clean); // re-read in case bootstrap just changed is_admin
   res.json({ token: issueToken(fresh), username: fresh.username, is_admin: !!fresh.is_admin, avatar: fresh.avatar || null });
+}));
+
+// Public (no login required) so even a banned/suspended/logged-out user, or
+// someone stuck on the login screen, can see who to reach for help.
+app.get("/api/admin-contact", safe(async (req, res) => {
+  const admins = await db.getAdminUsers();
+  res.json({ usernames: admins.map(a => a.username) });
 }));
 
 app.get("/api/me", authMiddleware, safe(async (req, res) => {
@@ -387,17 +416,22 @@ app.get("/api/messages/:username", authMiddleware, safe(async (req, res) => {
     file_name: r.file_name || null,
     file_type: r.file_type || null,
     shared_username: r.shared_username || null,
+    status_text: r.status_text || null,
+    status_image: r.status_image || null,
+    view_once: !!r.view_once,
+    viewed_at: r.viewed_at || null,
+    is_recipient: r.receiver_id === req.userId,
     created_at: r.created_at
   }));
   res.json({ messages: out });
 }));
 
 app.post("/api/messages", authMiddleware, safe(async (req, res) => {
-  const { to, numbers, kind, image, file_data, file_name, file_type, shared_username } = req.body || {};
+  const { to, numbers, kind, image, file_data, file_name, file_type, shared_username, status_text, status_image, view_once } = req.body || {};
   const other = await db.getUserByUsername((to || "").trim().toLowerCase());
   if (!other) return res.status(404).json({ error: "Recipient not found." });
 
-  const validKinds = ["text", "image", "video", "file", "contact"];
+  const validKinds = ["text", "image", "video", "file", "contact", "status"];
   const msgKind = validKinds.includes(kind) ? kind : "text";
   if (msgKind === "text" && (!Array.isArray(numbers) || numbers.length === 0)) {
     return res.status(400).json({ error: "Encoded numbers required." });
@@ -407,6 +441,9 @@ app.post("/api/messages", authMiddleware, safe(async (req, res) => {
   }
   if ((msgKind === "video" || msgKind === "file") && (!file_data || !file_name)) {
     return res.status(400).json({ error: "File data and file name required." });
+  }
+  if (msgKind === "status" && !status_text && !status_image) {
+    return res.status(400).json({ error: "Nothing to forward." });
   }
   // MongoDB rejects any document over 16MB (16,777,216 bytes) outright.
   // This threshold matches the client's MAX_ATTACHMENT_BYTES (11MB raw)
@@ -419,6 +456,8 @@ app.post("/api/messages", authMiddleware, safe(async (req, res) => {
       return res.status(413).json({ error: "That attachment is too large (max ~11MB) and was not sent." });
     }
   }
+  // view_once only makes sense for actual media attachments.
+  const viewOnce = !!view_once && (msgKind === "image" || msgKind === "video");
   let sharedTarget = null;
   if (msgKind === "contact") {
     const cleanShared = (shared_username || "").trim().toLowerCase();
@@ -429,7 +468,10 @@ app.post("/api/messages", authMiddleware, safe(async (req, res) => {
   const saved = await db.insertMessage({
     sender_id: req.userId, receiver_id: other.id, kind: msgKind,
     numbers, image, file_data, file_name, file_type,
-    shared_username: sharedTarget ? sharedTarget.username : null
+    shared_username: sharedTarget ? sharedTarget.username : null,
+    status_text: msgKind === "status" ? (status_text || null) : null,
+    status_image: msgKind === "status" ? (status_image || null) : null,
+    view_once: viewOnce
   });
 
   const payload = {
@@ -443,29 +485,140 @@ app.post("/api/messages", authMiddleware, safe(async (req, res) => {
     file_name: file_name || null,
     file_type: file_type || null,
     shared_username: sharedTarget ? sharedTarget.username : null,
+    status_text: saved.status_text || null,
+    status_image: saved.status_image || null,
+    view_once: viewOnce,
+    viewed_at: null,
+    is_recipient: false, // the sender's own copy of the payload
     created_at: saved.created_at
   };
 
   // Delivered to the recipient's personal room, not a contacts-gated pair
   // room — so a message from someone you haven't added yet still arrives
   // live instead of silently sitting in the database until you add them.
-  io.to(`user:${other.id}`).emit("chat:message", { message: payload });
+  io.to(`user:${other.id}`).emit("chat:message", { message: { ...payload, is_recipient: true } });
   res.json({ message: payload });
 }));
 
+// Opens a view-once image/video. Only the RECIPIENT can burn it (the
+// sender doesn't get a second look either, once it's opened) — the media
+// is deleted from the database right here, so a later fetch of this
+// conversation will never see it again, for either side.
+app.post("/api/messages/:id/view", authMiddleware, safe(async (req, res) => {
+  const id = Number(req.params.id);
+  const msg = await db.getMessageById(id);
+  if (!msg) return res.status(404).json({ error: "Message not found." });
+  if (msg.receiver_id !== req.userId) return res.status(403).json({ error: "Only the recipient can open this." });
+  if (!msg.view_once) return res.status(400).json({ error: "This attachment isn't view-once." });
+  if (msg.viewed_at) return res.status(410).json({ error: "This was already opened and is gone." });
+
+  const media = { image: msg.image || null, file_data: msg.file_data || null, file_name: msg.file_name || null, file_type: msg.file_type || null };
+  const updated = await db.markMessageViewed(id);
+  io.to(`user:${msg.sender_id}`).emit("chat:message-viewed", { id, by: req.username });
+  res.json({ ...media, viewed_at: updated.viewed_at });
+}));
+
 // ---------------------------------------------------------------------------
-// STATUSES
+// STATUSES — visible to the poster's contacts + anyone @mentioned; expire
+// after 5 minutes (see Status schema's TTL index in db.js).
 // ---------------------------------------------------------------------------
 app.get("/api/statuses", authMiddleware, safe(async (req, res) => {
-  res.json({ statuses: await db.getStatuses(100) });
+  res.json({ statuses: await db.getStatuses(req.userId) });
 }));
 
 app.post("/api/statuses", authMiddleware, safe(async (req, res) => {
-  const { text, image } = req.body || {};
+  const { text, image, mentioned_usernames } = req.body || {};
   if (!text || !text.trim()) return res.status(400).json({ error: "Status text required." });
-  const saved = await db.insertStatus({ user_id: req.userId, text: text.trim(), image });
-  io.emit("status:new", { id: saved.id, username: req.username, text: text.trim(), image: image || null, created_at: saved.created_at });
-  res.json({ ok: true });
+  const rawMentions = Array.isArray(mentioned_usernames) ? mentioned_usernames : [];
+  if (rawMentions.length > 7) return res.status(400).json({ error: "You can mention at most 7 people." });
+  const cleanMentions = [];
+  for (const raw of rawMentions) {
+    const clean = (raw || "").trim().toLowerCase().replace(/^@/, "");
+    if (!clean || clean === req.username || cleanMentions.includes(clean)) continue;
+    const u = await db.getUserByUsername(clean);
+    if (u) cleanMentions.push(u.username);
+  }
+
+  const saved = await db.insertStatus({ user_id: req.userId, text: text.trim(), image, mentioned_usernames: cleanMentions });
+  const payload = {
+    id: saved.id, username: req.username, text: saved.text, image: saved.image || null,
+    mentioned_usernames: cleanMentions, reshared_from: null, comments: [], created_at: saved.created_at
+  };
+  const audience = await statusAudienceUserIds(req.userId, cleanMentions);
+  audience.forEach(uid => io.to(`user:${uid}`).emit("status:new", payload));
+  res.json({ ok: true, status: payload });
+}));
+
+// Sends this status's content as a private chat message — only the poster
+// or someone @mentioned in it may do this.
+app.post("/api/statuses/:id/forward", authMiddleware, safe(async (req, res) => {
+  const status = await db.getStatusById(Number(req.params.id));
+  if (!status) return res.status(404).json({ error: "That status is gone (it may have expired)." });
+  const isPoster = status.user_id === req.userId;
+  const isMentioned = (status.mentioned_usernames || []).includes(req.username);
+  if (!isPoster && !isMentioned) return res.status(403).json({ error: "Only the poster or someone mentioned in this status can forward it." });
+
+  const target = await db.getUserByUsername((req.body?.to || "").trim().toLowerCase());
+  if (!target) return res.status(404).json({ error: "Recipient not found." });
+  const poster = await db.getUserById(status.user_id);
+
+  const saved = await db.insertMessage({
+    sender_id: req.userId, receiver_id: target.id, kind: "status",
+    status_text: status.text, status_image: status.image || null,
+    shared_username: poster ? poster.username : "unknown"
+  });
+  const payload = {
+    id: saved.id, from: req.username, from_id: req.userId, kind: "status",
+    numbers: null, image: null, file_data: null, file_name: null, file_type: null,
+    shared_username: saved.shared_username, status_text: saved.status_text, status_image: saved.status_image,
+    view_once: false, viewed_at: null, created_at: saved.created_at
+  };
+  io.to(`user:${target.id}`).emit("chat:message", { message: { ...payload, is_recipient: true } });
+  res.json({ message: { ...payload, is_recipient: false } });
+}));
+
+// Reposts this status as a NEW status under the resharer's own name —
+// `reshared_from` keeps the original poster visible so contacts can see it
+// was reshared, not original. Only the poster or someone @mentioned may do
+// this; the reshared copy gets its own fresh 5-minute lifespan.
+app.post("/api/statuses/:id/reshare", authMiddleware, safe(async (req, res) => {
+  const status = await db.getStatusById(Number(req.params.id));
+  if (!status) return res.status(404).json({ error: "That status is gone (it may have expired)." });
+  const isPoster = status.user_id === req.userId;
+  const isMentioned = (status.mentioned_usernames || []).includes(req.username);
+  if (!isPoster && !isMentioned) return res.status(403).json({ error: "Only the poster or someone mentioned in this status can reshare it." });
+
+  const poster = await db.getUserById(status.user_id);
+  const saved = await db.insertStatus({
+    user_id: req.userId, text: status.text, image: status.image,
+    mentioned_usernames: [], reshared_from: poster ? poster.username : "unknown"
+  });
+  const payload = {
+    id: saved.id, username: req.username, text: saved.text, image: saved.image || null,
+    mentioned_usernames: [], reshared_from: saved.reshared_from, comments: [], created_at: saved.created_at
+  };
+  const audience = await statusAudienceUserIds(req.userId, []);
+  audience.forEach(uid => io.to(`user:${uid}`).emit("status:new", payload));
+  res.json({ ok: true, status: payload });
+}));
+
+// Anyone who can see a status (the poster, a contact of theirs, or someone
+// @mentioned in it) can comment on it.
+app.post("/api/statuses/:id/comments", authMiddleware, safe(async (req, res) => {
+  const status = await db.getStatusById(Number(req.params.id));
+  if (!status) return res.status(404).json({ error: "That status is gone (it may have expired)." });
+  const isPoster = status.user_id === req.userId;
+  const isMentioned = (status.mentioned_usernames || []).includes(req.username);
+  const isContact = isPoster ? true : await db.areContacts(req.userId, status.user_id);
+  if (!isPoster && !isMentioned && !isContact) return res.status(403).json({ error: "You can't comment on this status." });
+
+  const { text } = req.body || {};
+  if (!text || !text.trim()) return res.status(400).json({ error: "Comment text required." });
+  const comment = await db.insertStatusComment({ status_id: status.id, user_id: req.userId, text: text.trim() });
+  const payload = { status_id: status.id, id: comment.id, username: req.username, text: comment.text, created_at: comment.created_at };
+  const audience = await statusAudienceUserIds(status.user_id, status.mentioned_usernames);
+  audience.forEach(uid => io.to(`user:${uid}`).emit("status:comment", payload));
+  res.json({ comment: payload });
 }));
 
 // ---------------------------------------------------------------------------
@@ -481,6 +634,7 @@ app.post("/api/meetings", authMiddleware, safe(async (req, res) => {
     return res.status(400).json({ error: "max_participants must be a whole number of 1 or more." });
   }
   await db.createMeeting(clean, req.userId, req.username, cap);
+  notifyAdmins("admin:meeting-created", { pin: clean, host_username: req.username, created_at: new Date() });
   res.json({ pin: clean, max_participants: cap });
 }));
 
@@ -525,6 +679,7 @@ app.post("/api/meetings/:pin/close", authMiddleware, safe(async (req, res) => {
 
   await db.closeMeeting(req.params.pin, req.userId);
   io.to(`meeting:${req.params.pin}`).emit("meeting:closed", { pin: req.params.pin });
+  notifyAdmins("admin:meeting-closed", { pin: req.params.pin, closed_by: req.username, closed_at: new Date() });
   res.json({ ok: true });
 }));
 
@@ -577,6 +732,7 @@ app.post("/api/meetings/:pin/request-access", authMiddleware, safe(async (req, r
   if (meeting.status !== "CLOSED") return res.status(400).json({ error: "This meeting isn't closed — you can join it directly." });
 
   const request = await db.createAccessRequest(req.params.pin, req.userId, req.username);
+  notifyAdmins("admin:meeting-access-requested", { id: request.id, pin: req.params.pin, requester_username: req.username, created_at: request.created_at });
   res.json({ request });
 }));
 
