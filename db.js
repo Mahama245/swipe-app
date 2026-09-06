@@ -61,7 +61,7 @@ const MessageSchema = new mongoose.Schema({
   id: { type: Number, unique: true },
   sender_id: Number,
   receiver_id: Number,
-  kind: String, // "text" | "image" | "video" | "file" | "contact"
+  kind: String, // "text" | "image" | "video" | "file" | "contact" | "status"
   numbers: mongoose.Schema.Types.Mixed,
   image: String,
   // video/file share a generic payload shape rather than one field per kind
@@ -70,6 +70,15 @@ const MessageSchema = new mongoose.Schema({
   file_type: String, // mime type
   // "contact" kind — a shared contact card, added by tapping in the chat
   shared_username: String,
+  // "status" kind — a forwarded status (plain text/image, not the numeric
+  // cipher, since it's a copy of a status post, not an encoded message)
+  status_text: String,
+  status_image: String,
+  // View-once media (image/video only). Once the RECIPIENT opens it, the
+  // server deletes `image`/`file_data` for good (see markMessageViewed) —
+  // gone for both sides, matching "disappears after they open it".
+  view_once: { type: Boolean, default: false },
+  viewed_at: { type: Date, default: null },
   created_at: { type: Date, default: Date.now }
 });
 const Message = mongoose.model("Message", MessageSchema);
@@ -79,9 +88,25 @@ const StatusSchema = new mongoose.Schema({
   user_id: Number,
   text: String,
   image: String,
-  created_at: { type: Date, default: Date.now }
+  // Up to 7 usernames tagged in this status — mentioned users are allowed
+  // to see it even if they're not a contact of the poster, and are the
+  // only ones (besides the poster) allowed to forward/reshare it.
+  mentioned_usernames: { type: [String], default: [] },
+  // Set when this status is itself a reshare of someone else's post, so
+  // viewers can see it was reshared rather than original.
+  reshared_from: { type: String, default: null },
+  created_at: { type: Date, default: Date.now, expires: 300 } // auto-delete after 5 min
 });
 const Status = mongoose.model("Status", StatusSchema);
+
+const StatusCommentSchema = new mongoose.Schema({
+  id: { type: Number, unique: true },
+  status_id: Number,
+  user_id: Number,
+  text: String,
+  created_at: { type: Date, default: Date.now, expires: 300 } // dies with the status
+});
+const StatusComment = mongoose.model("StatusComment", StatusCommentSchema);
 
 const MeetingSchema = new mongoose.Schema({
   pin: { type: String, unique: true },
@@ -246,6 +271,12 @@ function isBootstrapAdminUsername(username) {
 // ---------------------------------------------------------------------------
 // ADMIN — user management
 // ---------------------------------------------------------------------------
+// Every current admin's id + username — used both to live-notify admins of
+// meeting activity, and for the "reach out to admin" note shown to users.
+async function getAdminUsers() {
+  const rows = await User.find({ is_admin: true }).select("id username").lean();
+  return rows.map(u => ({ id: u.id, username: u.username }));
+}
 async function listUsers() {
   const users = await User.find().sort({ id: 1 }).lean();
   return users.map(u => ({
@@ -438,7 +469,7 @@ async function getConversations(userId) {
   return results.filter(Boolean).sort((a, b) => new Date(b.last_message.created_at) - new Date(a.last_message.created_at));
 }
 
-async function insertMessage({ sender_id, receiver_id, kind, numbers, image, file_data, file_name, file_type, shared_username }) {
+async function insertMessage({ sender_id, receiver_id, kind, numbers, image, file_data, file_name, file_type, shared_username, status_text, status_image, view_once }) {
   const id = await nextId("message");
   const msg = await Message.create({
     id, sender_id, receiver_id, kind,
@@ -447,25 +478,82 @@ async function insertMessage({ sender_id, receiver_id, kind, numbers, image, fil
     file_data: file_data || null,
     file_name: file_name || null,
     file_type: file_type || null,
-    shared_username: shared_username || null
+    shared_username: shared_username || null,
+    status_text: status_text || null,
+    status_image: status_image || null,
+    view_once: !!view_once
   });
   return msg.toObject();
+}
+
+async function getMessageById(id) {
+  return Message.findOne({ id }).lean();
+}
+
+// Burns a view-once attachment for good — called the moment the RECIPIENT
+// opens it. Deletes the actual media from the database entirely (not just
+// hides it), so it's really gone for both sides, not recoverable by
+// re-fetching the conversation.
+async function markMessageViewed(id) {
+  return Message.findOneAndUpdate(
+    { id },
+    { image: null, file_data: null, viewed_at: new Date() },
+    { new: true }
+  ).lean();
 }
 
 // ---------------------------------------------------------------------------
 // STATUSES
 // ---------------------------------------------------------------------------
-async function getStatuses(limit) {
-  const rows = await Status.find().sort({ id: -1 }).limit(limit || 100).lean();
-  return Promise.all(rows.map(async s => ({
-    ...s,
-    username: (await getUserById(s.user_id))?.username || "unknown"
-  })));
+// A status is visible to: the poster themself, the poster's contacts, and
+// anyone specifically @mentioned in it (even if not a contact) — mirrors
+// who's allowed to forward/reshare it (poster + mentioned).
+async function getStatuses(userId) {
+  const contactRows = await Contact.find({ user_id: userId }).lean();
+  const contactIds = contactRows.map(c => c.contact_id);
+  const me = await getUserById(userId);
+  const myUsername = me ? me.username : null;
+  const rows = await Status.find({
+    $or: [
+      { user_id: { $in: [...contactIds, userId] } },
+      { mentioned_usernames: myUsername }
+    ]
+  }).sort({ id: -1 }).limit(200).lean();
+  return Promise.all(rows.map(async s => attachStatusExtras(s, myUsername)));
 }
-async function insertStatus({ user_id, text, image }) {
+async function getStatusById(id) {
+  return Status.findOne({ id }).lean();
+}
+async function attachStatusExtras(s, viewerUsername) {
+  const poster = await getUserById(s.user_id);
+  const posterUsername = poster ? poster.username : "unknown";
+  const comments = await StatusComment.find({ status_id: s.id }).sort({ id: 1 }).lean();
+  const commentsWithNames = await Promise.all(comments.map(async c => ({
+    id: c.id,
+    username: (await getUserById(c.user_id))?.username || "unknown",
+    text: c.text,
+    created_at: c.created_at
+  })));
+  return {
+    ...s,
+    username: posterUsername,
+    comments: commentsWithNames,
+    can_forward: !!viewerUsername && (viewerUsername === posterUsername || (s.mentioned_usernames || []).includes(viewerUsername))
+  };
+}
+async function insertStatus({ user_id, text, image, mentioned_usernames, reshared_from }) {
   const id = await nextId("status");
-  const status = await Status.create({ id, user_id, text, image: image || null });
+  const status = await Status.create({
+    id, user_id, text, image: image || null,
+    mentioned_usernames: (mentioned_usernames || []).slice(0, 7),
+    reshared_from: reshared_from || null
+  });
   return status.toObject();
+}
+async function insertStatusComment({ status_id, user_id, text }) {
+  const id = await nextId("status_comment");
+  const comment = await StatusComment.create({ id, status_id, user_id, text });
+  return comment.toObject();
 }
 
 // ---------------------------------------------------------------------------
@@ -619,13 +707,13 @@ async function deleteAuthenticator(user_id, credential_id) {
 
 module.exports = {
   getUserByUsername, getUserById, createUser, ensureBootstrapAdmin, isBootstrapAdminUsername,
-  listUsers, setUserStatus, deleteUserAccount, setUserPasswordHash, setUserAvatar,
+  listUsers, setUserStatus, deleteUserAccount, setUserPasswordHash, setUserAvatar, getAdminUsers,
   createUsernameChangeRequest, getPendingUsernameRequestForUser, getPendingUsernameRequests, resolveUsernameRequest,
   logAdminAction, getAdminAuditLog,
   addContactPair, getContacts, getConversations, areContacts,
   createContactRequest, getPendingContactRequestsFor, resolveContactRequest,
-  getMessagesBetween, insertMessage,
-  getStatuses, insertStatus,
+  getMessagesBetween, insertMessage, getMessageById, markMessageViewed,
+  getStatuses, getStatusById, insertStatus, insertStatusComment,
   getMeeting, createMeeting, closeMeeting, canAccessMeeting, getMeetingMessages, insertMeetingMessage,
   joinAsParticipant, setMeetingCapacity, resetMeetingCapacity, reopenMeetingForAllParticipants, getMeetingParticipants,
   createAccessRequest, getPendingAccessRequests, resolveAccessRequest,
