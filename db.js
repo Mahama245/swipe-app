@@ -189,8 +189,14 @@ const AuthenticatorSchema = new mongoose.Schema({
 const Authenticator = mongoose.model("Authenticator", AuthenticatorSchema);
 
 // temporary storage for in-flight WebAuthn challenges — TTL index auto-cleans
+// after 5 min. `key` is a Number (the user's id) for the "register a device"
+// flow, since that's always tied to a logged-in user. For the "log in with
+// biometrics" flow there's no user yet, so it's keyed by a random per-attempt
+// string instead — NOT a fixed shared slot, or two people tapping Face ID at
+// the same moment would overwrite each other's in-flight challenge and both
+// logins would fail verification.
 const ChallengeSchema = new mongoose.Schema({
-  user_id: { type: Number, index: true },
+  key: { type: mongoose.Schema.Types.Mixed, index: true },
   challenge: String,
   created_at: { type: Date, default: Date.now, expires: 300 } // auto-delete after 5 min
 });
@@ -260,7 +266,7 @@ async function deleteUserAccount(userId) {
   await User.deleteOne({ id: userId });
   await Contact.deleteMany({ $or: [{ user_id: userId }, { contact_id: userId }] });
   await Authenticator.deleteMany({ user_id: userId });
-  await Challenge.deleteMany({ user_id: userId });
+  await Challenge.deleteMany({ key: userId });
   return user;
 }
 async function setUserPasswordHash(userId, password_hash) {
@@ -347,7 +353,7 @@ async function getContacts(userId) {
   const users = await Promise.all(rows.map(c => getUserById(c.contact_id)));
   return users
     .filter(Boolean)
-    .map(u => ({ id: u.id, username: u.username }))
+    .map(u => ({ id: u.id, username: u.username, avatar: u.avatar || null }))
     .sort((a, b) => a.username.localeCompare(b.username));
 }
 
@@ -370,7 +376,7 @@ async function getPendingContactRequestsFor(userId) {
   const rows = await ContactRequest.find({ to_id: userId, status: "PENDING" }).sort({ created_at: -1 }).lean();
   const withUsernames = await Promise.all(rows.map(async r => {
     const from = await getUserById(r.from_id);
-    return from ? { id: r.id, from_id: r.from_id, from_username: from.username, created_at: r.created_at } : null;
+    return from ? { id: r.id, from_id: r.from_id, from_username: from.username, from_avatar: from.avatar || null, created_at: r.created_at } : null;
   }));
   return withUsernames.filter(Boolean);
 }
@@ -418,6 +424,7 @@ async function getConversations(userId) {
     return {
       id: user.id,
       username: user.username,
+      avatar: user.avatar || null,
       is_contact: contactIds.has(otherId),
       last_message: {
         kind: lastMsg.kind,
@@ -576,16 +583,19 @@ async function resolveAccessRequest(id, approve, resolved_by) {
 // ---------------------------------------------------------------------------
 // WEBAUTHN (biometric login)
 // ---------------------------------------------------------------------------
-async function saveChallenge(user_id, challenge) {
-  await Challenge.deleteMany({ user_id: user_id ?? null });
-  await Challenge.create({ user_id: user_id ?? null, challenge });
+// `key` is the registering user's numeric id for the "add a device" flow,
+// or a random per-attempt string (see server.js) for the "log in with
+// biometrics" flow, where there's no user id yet.
+async function saveChallenge(key, challenge) {
+  await Challenge.deleteMany({ key });
+  await Challenge.create({ key, challenge });
 }
-async function getChallenge(user_id) {
-  const row = await Challenge.findOne({ user_id: user_id ?? null }).sort({ created_at: -1 }).lean();
+async function getChallenge(key) {
+  const row = await Challenge.findOne({ key }).sort({ created_at: -1 }).lean();
   return row ? row.challenge : null;
 }
-async function clearChallenge(user_id) {
-  await Challenge.deleteMany({ user_id: user_id ?? null });
+async function clearChallenge(key) {
+  await Challenge.deleteMany({ key });
 }
 async function addAuthenticator({ user_id, credential_id, public_key, counter, device_type, backed_up, transports, nickname }) {
   const auth = await Authenticator.create({
