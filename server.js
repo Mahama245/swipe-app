@@ -1,4 +1,5 @@
 require("dotenv").config();
+const crypto = require("crypto");
 const express = require("express");
 const http = require("http");
 const path = require("path");
@@ -191,22 +192,28 @@ app.post("/api/webauthn/login-options", safe(async (req, res) => {
     rpID: RP_ID,
     userVerification: "required"
   });
-  await db.saveChallenge(null, options.challenge);
-  res.json(options);
+  // Random per-attempt key, NOT a fixed shared slot — otherwise two people
+  // starting biometric login around the same moment would overwrite each
+  // other's in-flight challenge and both would fail verification.
+  const attemptId = crypto.randomBytes(16).toString("hex");
+  await db.saveChallenge(attemptId, options.challenge);
+  res.json({ ...options, attemptId });
 }));
 
 // STEP 2 of logging in — verify the signed challenge, issue a normal JWT
 app.post("/api/webauthn/login-verify", safe(async (req, res) => {
-  const expectedChallenge = await db.getChallenge(null);
+  const { attemptId, ...credentialResponse } = req.body || {};
+  if (!attemptId) return res.status(400).json({ error: "Login expired. Try again." });
+  const expectedChallenge = await db.getChallenge(attemptId);
   if (!expectedChallenge) return res.status(400).json({ error: "Login expired. Try again." });
 
-  const authenticator = await db.getAuthenticatorByCredentialId(req.body.id);
+  const authenticator = await db.getAuthenticatorByCredentialId(credentialResponse.id);
   if (!authenticator) return res.status(400).json({ error: "This device isn't registered to any account." });
 
   let verification;
   try {
     verification = await verifyAuthenticationResponse({
-      response: req.body,
+      response: credentialResponse,
       expectedChallenge,
       expectedOrigin: ORIGIN,
       expectedRPID: RP_ID,
@@ -223,7 +230,7 @@ app.post("/api/webauthn/login-verify", safe(async (req, res) => {
   if (!verification.verified) return res.status(400).json({ error: "Verification failed." });
 
   await db.updateAuthenticatorCounter(authenticator.credential_id, verification.authenticationInfo.newCounter);
-  await db.clearChallenge(null);
+  await db.clearChallenge(attemptId);
 
   const user = await db.getUserById(authenticator.user_id);
   if (!user) return res.status(404).json({ error: "Account not found." });
@@ -401,13 +408,15 @@ app.post("/api/messages", authMiddleware, safe(async (req, res) => {
   if ((msgKind === "video" || msgKind === "file") && (!file_data || !file_name)) {
     return res.status(400).json({ error: "File data and file name required." });
   }
-  // MongoDB rejects any document over 16MB outright — this is the real
-  // backstop (the client-side check is just a faster, friendlier version
-  // of the same limit).
+  // MongoDB rejects any document over 16MB (16,777,216 bytes) outright.
+  // This threshold matches the client's MAX_ATTACHMENT_BYTES (11MB raw)
+  // after base64 inflation (~15MB), leaving headroom for the rest of the
+  // document — this is the real backstop, the client-side check is just a
+  // faster, friendlier version of the same limit.
   if ((msgKind === "video" || msgKind === "file" || msgKind === "image")) {
     const payloadSize = (file_data || image || "").length;
-    if (payloadSize > 11 * 1024 * 1024) {
-      return res.status(413).json({ error: "That attachment is too large. Try a smaller file (max ~8MB)." });
+    if (payloadSize > 15 * 1024 * 1024) {
+      return res.status(413).json({ error: "That attachment is too large (max ~11MB) and was not sent." });
     }
   }
   let sharedTarget = null;
@@ -593,7 +602,7 @@ app.get("/api/meetings/:pin/participants", authMiddleware, safe(async (req, res)
   const contactIds = new Set(myContacts.map(c => c.id));
   const participants = all
     .filter(p => p.id !== req.userId)
-    .map(p => ({ id: p.id, username: p.username, is_contact: contactIds.has(p.id) }));
+    .map(p => ({ id: p.id, username: p.username, avatar: p.avatar || null, is_contact: contactIds.has(p.id) }));
   res.json({ participants });
 }));
 
