@@ -388,18 +388,34 @@ const { startRegistration, startAuthentication, browserSupportsWebAuthn } = Simp
   btn.style.display = "block";
 })();
 
+// Surfaces *why* a WebAuthn ceremony failed instead of a generic message —
+// in particular, a SecurityError almost always means RP_ID/ORIGIN (in the
+// server's environment variables) don't match the domain the app is
+// actually running on, which makes the browser refuse to even show the
+// native Face ID / fingerprint prompt at all.
+function webauthnErrorMessage(e){
+  if (e.name === "SecurityError") {
+    return "This device blocked biometric setup because the app's configured domain (RP_ID/ORIGIN) doesn't match the URL you're using. Ask whoever runs the server to check those settings.";
+  }
+  if (e.name === "NotSupportedError") {
+    return "This device or browser doesn't support Face ID / fingerprint login.";
+  }
+  return null; // caller falls back to its own generic message
+}
+
 document.getElementById("biometricLoginBtn").addEventListener("click", async () => {
   try {
     const optRes = await fetch("/api/webauthn/login-options", { method: "POST" });
     const options = await optRes.json();
     if (!optRes.ok) { showAuthError(options.error || "Couldn't start biometric login."); return; }
+    const { attemptId, ...authOptions } = options;
 
-    const authResp = await startAuthentication({ optionsJSON: options });
+    const authResp = await startAuthentication({ optionsJSON: authOptions });
 
     const verifyRes = await fetch("/api/webauthn/login-verify", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(authResp)
+      body: JSON.stringify({ ...authResp, attemptId })
     });
     const data = await verifyRes.json();
     if (!verifyRes.ok) { showAuthError(data.error || "Biometric login failed."); return; }
@@ -413,7 +429,7 @@ document.getElementById("biometricLoginBtn").addEventListener("click", async () 
     enterApp();
   } catch (e) {
     // user cancelled the prompt, or no registered device on this browser
-    if (e.name !== "NotAllowedError") showAuthError("Biometric login isn't set up on this device yet. Log in with your password, then enable it in settings.");
+    if (e.name !== "NotAllowedError") showAuthError(webauthnErrorMessage(e) || "Biometric login isn't set up on this device yet. Log in with your password, then enable it in settings.");
   }
 });
 
@@ -435,7 +451,7 @@ async function enableBiometricLogin(){
     if (!verifyRes.ok) { toast(data.error || "Setup failed.", true); return; }
     toast("Face ID / fingerprint login enabled on this device ✓");
   } catch (e) {
-    if (e.name !== "NotAllowedError") toast("Couldn't set up biometric login on this device.", true);
+    if (e.name !== "NotAllowedError") toast(webauthnErrorMessage(e) || "Couldn't set up biometric login on this device.", true);
   }
 }
 
@@ -512,6 +528,23 @@ let lastFormula = "2x+1/2";
 const AVATAR_COLORS = ["#B98CFF", "#7FE0C4", "#F2A65A", "#8FA6E8", "#E89CC7", "#6FD6C1"];
 function colorFor(id){ return AVATAR_COLORS[id % AVATAR_COLORS.length]; }
 function initials(name){ return name.split(" ").map(w => w[0]).slice(0,2).join("").toUpperCase(); }
+
+// Renders another user's real profile picture when they have one, falling
+// back to the colored-initials placeholder otherwise. `user` needs
+// .id, .username and (optionally) .avatar; `avatarField` lets callers that
+// use a differently-named field (e.g. contact requests' `from_avatar`)
+// reuse this without reshaping their object first.
+function avatarHtml(user, size, opts){
+  opts = opts || {};
+  const avatar = opts.avatarField ? user[opts.avatarField] : user.avatar;
+  const name = opts.nameField ? user[opts.nameField] : user.username;
+  const id = opts.idField ? user[opts.idField] : user.id;
+  const dim = size || 28;
+  if (avatar) {
+    return `<img src="${avatar}" style="width:${dim}px; height:${dim}px; border-radius:50%; object-fit:cover; display:block; flex-shrink:0;">`;
+  }
+  return `<div class="contact-avatar" style="width:${dim}px; height:${dim}px; font-size:${Math.round(dim * 0.4)}px; background:${colorFor(id)}">${initials(name)}</div>`;
+}
 function getContact(id){ return contacts.find(c => c.id === id); }
 // Looks in both the curated contacts list AND the wider conversation inbox,
 // so a chat with someone you haven't added yet can still be opened.
@@ -633,7 +666,7 @@ function renderContactList(){
     const item = document.createElement("div");
     item.className = "contact-item" + (c.id === currentContactId ? " selected" : "");
     item.style.position = "relative";
-    item.innerHTML = `<div class="contact-avatar" style="background:${colorFor(c.id)}">${initials(c.username)}</div><span>${c.username}</span>
+    item.innerHTML = `${avatarHtml(c, 28)}<span>${c.username}</span>
       <button class="qr-share-btn" data-username="${escapeHtml(c.username)}" title="QR code / share">▦</button>`;
     item.querySelector(".qr-share-btn").addEventListener("click", (e) => {
       e.stopPropagation();
@@ -759,7 +792,7 @@ async function renderConversationInbox(){
       row.className = "contact-item";
       row.style.cssText = "padding:12px 14px; border:1px solid var(--border); border-radius:10px; margin-bottom:8px; cursor:pointer;";
       row.innerHTML = `
-        <div class="contact-avatar" style="background:${colorFor(c.id)}">${initials(c.username)}</div>
+        ${avatarHtml(c, 28)}
         <div style="flex:1; min-width:0;">
           <div style="display:flex; align-items:center; gap:6px;">
             <span style="font-weight:600;">@${escapeHtml(c.username)}</span>
@@ -785,7 +818,7 @@ function renderPendingContactRequests(){
   if (!pendingContactRequests.length) { block.innerHTML = ""; return; }
   block.innerHTML = pendingContactRequests.map(r => `
     <div class="contact-request-card" data-id="${r.id}">
-      <div class="contact-avatar" style="background:${colorFor(r.from_id)}">${initials(r.from_username)}</div>
+      ${avatarHtml({ id: r.from_id, username: r.from_username, avatar: r.from_avatar }, 28)}
       <div style="flex:1; min-width:0;">
         <div><strong>@${escapeHtml(r.from_username)}</strong></div>
         <div class="hint">wants to add you as a contact</div>
@@ -1807,8 +1840,11 @@ function sendText(contact, input){
 // MongoDB caps a single document at 16MB, and base64 encoding inflates raw
 // file bytes by about a third — so this stays well under that ceiling
 // (leaving room for the rest of the message document) instead of letting
-// uploads intermittently fail once they hit the database.
-const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+// uploads intermittently fail once they hit the database. NOTE: this
+// architecture (attachments stored inline as base64) genuinely cannot fit
+// a real-length video — this limit is close to the technical maximum
+// MongoDB will allow, not an arbitrary choice.
+const MAX_ATTACHMENT_BYTES = 11 * 1024 * 1024;
 
 function sendMedia(contact, kind){
   const fileInput = document.getElementById("fileInput");
@@ -1818,7 +1854,14 @@ function sendMedia(contact, kind){
     fileInput.value = "";
     if (!file) return;
     if (file.size > MAX_ATTACHMENT_BYTES) {
-      toast(`That file is too large (max ${humanFileSize(MAX_ATTACHMENT_BYTES)}).`, true);
+      // A toast can easily go unnoticed (especially on mobile), and the
+      // sender would otherwise walk away thinking the file went through
+      // when it never left the device — so this uses a blocking alert
+      // instead, with the actual file size so it's clear why it failed.
+      const kindHint = kind === "video"
+        ? " Try trimming the clip or sending it as a compressed video."
+        : "";
+      alert(`"${file.name}" is ${humanFileSize(file.size)} — that's over the ${humanFileSize(MAX_ATTACHMENT_BYTES)} limit for this app, so it was NOT sent.${kindHint}`);
       return;
     }
     const reader = new FileReader();
@@ -1833,9 +1876,9 @@ function sendMedia(contact, kind){
           body: JSON.stringify(body)
         });
         const data = await res.json();
-        if (!res.ok){ toast(data.error || "Couldn't send attachment.", true); return; }
+        if (!res.ok){ alert(data.error || "Couldn't send attachment — it was NOT delivered."); return; }
         appendLiveMessage(data.message);
-      }catch(e){ toast("Couldn't reach the server.", true); }
+      }catch(e){ alert("Couldn't reach the server — the attachment was NOT sent."); }
     };
     reader.readAsDataURL(file);
   };
@@ -2196,7 +2239,7 @@ async function openMeetingParticipants(){
       const row = document.createElement("div");
       row.className = "participant-row";
       row.innerHTML = `
-        <div class="contact-avatar" style="background:${colorFor(p.id)}">${initials(p.username)}</div>
+        ${avatarHtml(p, 28)}
         <div style="flex:1;"><strong>@${escapeHtml(p.username)}</strong></div>
         ${p.is_contact ? `<span class="hint">Contact ✓</span>` : ""}`;
       row.addEventListener("click", () => openParticipantProfile(p, backdrop));
@@ -2215,7 +2258,7 @@ function openParticipantProfile(participant, parentBackdrop){
   modal.className = "modal";
   modal.innerHTML = `
     <div style="display:flex; justify-content:center; margin-bottom:10px;">
-      <div class="contact-avatar" style="width:64px; height:64px; font-size:20px; background:${colorFor(participant.id)}">${initials(participant.username)}</div>
+      ${avatarHtml(participant, 64)}
     </div>
     <h3 style="text-align:center;">@${escapeHtml(participant.username)}</h3>
     <div class="modal-sub" style="text-align:center;">${participant.is_contact ? "Already in your contacts." : "Not in your contacts yet."}</div>
