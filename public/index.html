@@ -50,7 +50,7 @@ input, textarea, select{font-family:inherit;}
 @keyframes drift{ 0%,100%{ transform:translate(0,0) scale(1); } 50%{ transform:translate(40px,-30px) scale(1.15); } }
 @media (prefers-reduced-motion: reduce){ #smoke .wisp{ animation:none; } }
 
-#app{ position:relative; z-index:1; display:flex; height:100vh; }
+#app{ position:relative; z-index:1; display:flex; height:100vh; height:100dvh; }
 
 .sidebar{ width:260px; flex-shrink:0; background:var(--panel); border-right:1px solid var(--border); display:flex; flex-direction:column; padding:20px 16px; }
 .logo-row{ display:flex; align-items:center; gap:10px; padding:4px 4px 2px; }
@@ -159,10 +159,37 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
 ::-webkit-scrollbar-thumb{ background:var(--panel-alt); border-radius:4px; }
 ::-webkit-scrollbar-track{ background:transparent; }
 
-@media (max-width:720px){ .sidebar{ width:210px; padding:14px 10px; } .bubble{ max-width:80%; } }
+@media (max-width:720px){ .bubble{ max-width:80%; } }
+
+/* ---------- MOBILE: single-pane layout ----------
+   On a phone the fixed sidebar + main side-by-side barely fit — below this
+   width, only one pane is shown at a time: the sidebar (nav + contacts) by
+   default, sliding over to the main pane once you pick a nav item or a
+   contact, with a floating back button to return. Desktop keeps the
+   original two-pane layout untouched. */
+@media (max-width:760px){
+  .sidebar{ width:100%; }
+  #app{ position:relative; overflow:hidden; }
+  #app .sidebar, #app .main{ position:absolute; inset:0; width:100%; transition:transform .22s ease; }
+  #app:not(.mobile-show-main) .main{ transform:translateX(100%); }
+  #app.mobile-show-main .sidebar{ transform:translateX(-100%); }
+  #app.mobile-show-main #mobileBackBtn{ display:flex; }
+  #app.mobile-show-main .view-header{ padding-left:58px; }
+  .bubble{ max-width:86%; }
+  .meeting-hub{ padding:0 16px; }
+  .meeting-hub > div[style*="display:flex"]{ flex-wrap:wrap; justify-content:center; }
+  .status-card{ flex-wrap:wrap; }
+  .status-card > div{ flex:1; min-width:0; }
+  .compose input[type=text]{ min-width:100px; }
+}
+#mobileBackBtn{
+  display:none; position:fixed; top:14px; left:14px; z-index:60;
+  width:38px; height:38px; border-radius:50%; align-items:center; justify-content:center;
+  background:var(--panel-alt); border:1px solid var(--border); color:var(--text); font-size:18px;
+}
 
 /* ---------- AUTH SCREEN ---------- */
-#authScreen{ position:relative; z-index:1; height:100vh; display:flex; align-items:center; justify-content:center; }
+#authScreen{ position:relative; z-index:1; height:100vh; height:100dvh; display:flex; align-items:center; justify-content:center; }
 .auth-card{ width:360px; max-width:90vw; background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:32px; }
 .auth-card .brand{ font-size:28px; margin-bottom:4px; }
 .auth-card .tagline{ padding:0 0 22px; }
@@ -176,6 +203,10 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
 .auth-error{ color:var(--danger); font-size:12.5px; margin-bottom:12px; display:none; }
 .auth-error.show{ display:block; }
 .auth-card .btn-primary{ width:100%; padding:12px; font-size:14px; margin-top:6px; }
+
+/* placed last so it correctly overrides the unconditional .auth-card rule
+   above at matching specificity */
+@media (max-width:760px){ .auth-card{ padding:22px 20px; } }
 </style>
 </head>
 <body>
@@ -200,6 +231,7 @@ nav{ display:flex; flex-direction:column; gap:3px; margin-bottom:18px; }
 <div id="smoke" style="display:none;"><div class="wisp w1"></div><div class="wisp w2"></div><div class="wisp w3"></div></div>
 
 <div id="app" style="display:none;">
+  <button id="mobileBackBtn" title="Back">←</button>
   <div class="sidebar">
     <div class="logo-row">
       <svg width="40" height="40" viewBox="0 0 60 60" fill="none">
@@ -298,6 +330,7 @@ document.getElementById("enableBiometricBtn").addEventListener("click", enableBi
 document.getElementById("settingsBtn").addEventListener("click", () => {
   currentView = "settings";
   setActiveNav("settings");
+  showMobileMain();
   showSettingsView();
 });
 
@@ -735,6 +768,7 @@ function renderContactList(){
       currentContactId = c.id;
       currentView = "chats";
       setActiveNav("chats");
+      showMobileMain();
       renderContactList();
       renderChatView(c);
     });
@@ -798,6 +832,13 @@ function openContactCard(contact){
 function setActiveNav(view){
   document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.view === view));
 }
+
+// Mobile single-pane layout: slides the main pane over the sidebar. Only
+// has any visual effect under the ≤760px media query — harmless no-op
+// (class sits unused) on desktop widths.
+function showMobileMain(){ document.getElementById("app").classList.add("mobile-show-main"); }
+function showMobileSidebar(){ document.getElementById("app").classList.remove("mobile-show-main"); }
+document.getElementById("mobileBackBtn").addEventListener("click", showMobileSidebar);
 
 // =====================================================================
 // VIEW ROUTING
@@ -1494,6 +1535,7 @@ async function resolveUsernameRequestAction(request, action){
 document.querySelectorAll(".nav-btn").forEach(btn => {
   btn.addEventListener("click", () => {
     setActiveNav(btn.dataset.view);
+    showMobileMain();
     if (btn.dataset.view === "chats") showChatsView();
     else if (btn.dataset.view === "status") showStatusView();
     else if (btn.dataset.view === "admin") showAdminView();
